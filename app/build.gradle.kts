@@ -143,6 +143,47 @@ android {
                     "-DGGML_VULKAN=OFF"
                 )
 
+                // OpenCL offload, opt-in via OPENCL_SDK. Unlike Vulkan this is
+                // the backend Qualcomm targets at Adreno directly: llama.cpp
+                // lists Adreno 750 (Snapdragon 8 Gen 3) as verified and supports
+                // Q4_K, so the existing Q4_K_M catalogue works unchanged.
+                //
+                // The NDK sysroot ships neither the CL headers nor a libOpenCL.so
+                // to link against, so ggml-opencl's find_package(OpenCL REQUIRED)
+                // needs both pointed at explicitly. Expected layout:
+                //
+                //   $OPENCL_SDK/include/CL/*.h          KhronosGroup/OpenCL-Headers
+                //   $OPENCL_SDK/lib/arm64-v8a/libOpenCL.so  KhronosGroup/OpenCL-ICD-Loader,
+                //                                           built for arm64-v8a
+                //
+                // That .so is a link-time stub only. It is deliberately NOT
+                // packaged into the APK: on device the loader resolves the soname
+                // to the vendor's own /vendor/lib64/libOpenCL.so, which is the
+                // actual Adreno driver and is exported to apps via
+                // /vendor/etc/public.libraries.txt. Confirm that entry exists on
+                // the target device before assuming this resolves.
+                //
+                // Building this in is safe on non-Adreno hardware: the backend is
+                // a separate libggml-opencl.so loaded through GGML_BACKEND_DL, and
+                // ggml_backend_load_best() skips a backend whose .so will not load
+                // rather than failing. Devices without a driver fall back to CPU.
+                // What that does NOT cover is a driver that loads and then faults
+                // mid-inference, which is how the Vulkan attempt died -- so treat
+                // this as untested until it has run on a real Adreno device.
+                val openclSdk = System.getenv("OPENCL_SDK")?.replace('\\', '/')
+                if (openclSdk != null) {
+                    arguments += "-DGGML_OPENCL=ON"
+                    arguments += "-DOpenCL_INCLUDE_DIR=$openclSdk/include"
+                    arguments += "-DOpenCL_LIBRARY=$openclSdk/lib/arm64-v8a/libOpenCL.so"
+                    // Adreno-tuned matmul kernels, embedded so no .cl files ship
+                    // alongside the APK. Both are the upstream defaults; pinned
+                    // here so a llama.cpp bump cannot quietly flip them.
+                    arguments += "-DGGML_OPENCL_USE_ADRENO_KERNELS=ON"
+                    arguments += "-DGGML_OPENCL_EMBED_KERNELS=ON"
+                } else {
+                    arguments += "-DGGML_OPENCL=OFF"
+                }
+
                 val isWindows = System.getProperty("os.name").lowercase().contains("windows")
                 if (!isWindows) {
                     arguments += "-DHOST_C_COMPILER=/usr/bin/gcc"

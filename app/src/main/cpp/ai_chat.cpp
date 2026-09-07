@@ -29,9 +29,26 @@ constexpr int   N_THREADS_MIN           = 2;
 constexpr int   N_THREADS_MAX           = 4;
 constexpr int   N_THREADS_HEADROOM      = 2;
 
+// Two independent KV lanes share the context: the conversation, and the
+// background work the app runs alongside it (today the conversation-brief
+// merge). They share no prompt prefix, so before lanes existed each one's
+// prefill wiped the other's cache and both were permanently cold.
+//
+// With kv_unified = false llama.cpp splits n_ctx evenly, giving each lane
+// n_ctx / n_seq_max — so this costs no extra KV memory, it partitions what was
+// already allocated. Anything reasoning about a single conversation's room must
+// therefore use LANE_CONTEXT_SIZE, not the total.
+constexpr int   N_LANES                 = 2;
+constexpr int   LANE_CHAT               = 0;
+constexpr int   LANE_AUX                = 1;
+
 constexpr int   DEFAULT_CONTEXT_SIZE    = 8192;
+constexpr int   LANE_CONTEXT_SIZE       = DEFAULT_CONTEXT_SIZE / N_LANES;
 constexpr int   OVERFLOW_HEADROOM       = 4;
 constexpr int   BATCH_SIZE              = 512;
+// Layers pushed onto a GPU backend when one is present; 99 is llama.cpp's idiom
+// for "all of them". Only reachable once a backend .so actually loads.
+constexpr int   GPU_OFFLOAD_LAYERS      = 99;
 // Upper bound on the system-prompt prefill. Chosen so the decode stays inside
 // ART's ~10s GC-suspend window on a phone-class CPU (~3 batches). See the note
 // in processSystemPrompt.
@@ -42,7 +59,38 @@ static llama_model                      * g_model;
 static llama_context                    * g_context;
 static llama_batch                        g_batch;
 static common_chat_templates_ptr          g_chat_templates;
-static common_sampler                   * g_sampler;
+
+/**
+ * Everything that belongs to one conversation-in-flight.
+ *
+ * One instance per KV lane. `id` doubles as the llama.cpp sequence id, so a
+ * decode, an eviction and a context shift on one lane cannot touch the other.
+ */
+struct Lane {
+    int                            id = 0;
+    /** Exact token sequence resident in this lane at positions [0, size). Kept
+     *  in lockstep with every decode so the next turn can measure how much of
+     *  its prompt is already computed. See processSystemPrompt. */
+    llama_tokens                   cached_tokens;
+    std::vector<common_chat_msg>   chat_msgs;
+    llama_pos                      system_prompt_position = 0;
+    llama_pos                      current_position       = 0;
+    llama_pos                      stop_generation_position = 0;
+    std::string                    cached_token_chars;
+    std::ostringstream             assistant_ss;
+    common_sampler               * sampler = nullptr;
+};
+
+static Lane g_lanes[N_LANES];
+
+/** Falls back to the conversation lane rather than trusting an out-of-range id. */
+static Lane &lane_at(const int index) {
+    if (index < 0 || index >= N_LANES) {
+        LOGw("%s: lane %d out of range; using the conversation lane", __func__, index);
+        return g_lanes[LANE_CHAT];
+    }
+    return g_lanes[index];
+}
 
 // Secondary defense layer behind the Kotlin coroutine dispatcher
 // (Dispatchers.IO.limitedParallelism(1) in InferenceEngineImpl), which is
@@ -69,12 +117,37 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_init(JNIEnv *env, jobject /*unu
     LOGi("Backend initiated; Log handler set.");
 }
 
+static std::string get_backend(); // defined below, beside the other reporting
+
+/**
+ * True when a non-CPU backend registered during init().
+ *
+ * Backends ship as separate .so files (GGML_BACKEND_DL) and
+ * ggml_backend_load_best() skips any it cannot load, so this is the only
+ * trustworthy signal that offload is available: a build made with GGML_OPENCL=ON
+ * still lands on devices with no usable driver, and those must stay on the CPU.
+ */
+static bool has_gpu_backend() {
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        if (std::string(ggml_backend_reg_name(ggml_backend_reg_get(i))) != "CPU") {
+            return true;
+        }
+    }
+    return false;
+}
+
 extern "C"
 JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = 0; // Offload to GPU if Vulkan is available (disabled for Adreno stability)
+    // Offload everything when a GPU backend registered, nothing otherwise. This
+    // sat at a hard 0 because Vulkan offload triggered DeviceLostError on Adreno;
+    // with Vulkan compiled out it stays 0 on a CPU-only build and only lifts once
+    // an OpenCL backend .so actually loads (see OPENCL_SDK in app/build.gradle.kts).
+    model_params.n_gpu_layers = has_gpu_backend() ? GPU_OFFLOAD_LAYERS : 0;
+    LOGi("%s: backends=[%s], offloading %d layers",
+         __func__, get_backend().c_str(), model_params.n_gpu_layers);
     model_params.use_mmap = true;
 
     const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
@@ -89,7 +162,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     return 0;
 }
 
-static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT_CONTEXT_SIZE) {
+static llama_context *init_context(llama_model *model,
+                                   const int n_ctx = DEFAULT_CONTEXT_SIZE,
+                                   const int n_seq_max = N_LANES) {
     if (!model) {
         LOGe("%s: model cannot be null", __func__);
         return nullptr;
@@ -109,8 +184,21 @@ static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT
              __func__, trained_context_size, n_ctx);
     }
     ctx_params.n_ctx = n_ctx;
+    // One sequence per lane. kv_unified is off deliberately: llama.cpp warns it
+    // hurts when sequences do not share a large prefix, and ours share none —
+    // one is a chat transcript, the other a summarisation prompt. Off also makes
+    // the split explicit at n_ctx / n_seq_max instead of letting both lanes
+    // believe they own the whole context.
+    ctx_params.n_seq_max = n_seq_max;
+    ctx_params.kv_unified = false;
     ctx_params.n_batch = BATCH_SIZE;
-    ctx_params.n_ubatch = 64; // Workaround for Adreno vk::DeviceLostError (TDR)
+    // Physical batch, kept equal to n_batch so each 512-token prefill chunk is a
+    // single pass instead of eight. It was pinned to 64 to work around an Adreno
+    // vk::DeviceLostError (TDR); that no longer applies while GGML_VULKAN is OFF
+    // and every decode runs on the CPU backend. Restore the 64 cap alongside any
+    // change that puts decoding back on the GPU -- the Adreno fault it guarded
+    // against is a property of the hardware, not of Vulkan specifically.
+    ctx_params.n_ubatch = BATCH_SIZE;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
     auto *context = llama_init_from_model(g_model, ctx_params);
@@ -133,9 +221,15 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv * /*env*/, jobje
     auto *context = init_context(g_model);
     if (!context) { return 1; }
     g_context = context;
-    g_batch = llama_batch_init(BATCH_SIZE, 0, 1);
+    // A batch entry has to be able to name the lane it belongs to.
+    g_batch = llama_batch_init(BATCH_SIZE, 0, N_LANES);
     g_chat_templates = common_chat_templates_init(g_model, "");
-    g_sampler = new_sampler(DEFAULT_SAMPLER_TEMP);
+    for (int i = 0; i < N_LANES; i++) {
+        Lane &lane = g_lanes[i];
+        lane = Lane{};                       // new context, nothing resident
+        lane.id = i;
+        lane.sampler = new_sampler(DEFAULT_SAMPLER_TEMP);
+    }
     return 0;
 }
 
@@ -162,7 +256,9 @@ JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject /*unused*/, jint pp, jint tg,
                                                       jint pl, jint nr) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
-    auto *context = init_context(g_model, pp);
+    // Single sequence: the benchmark wants the whole pp-token window to itself,
+    // not the per-lane split the chat context uses.
+    auto *context = init_context(g_model, pp, /* n_seq_max */ 1);
     if (!context) {
         const auto *const err_msg = "Fail to init_context! Bench aborted.";
         LOGe(err_msg);
@@ -274,17 +370,16 @@ constexpr const char *ROLE_SYSTEM       = "system";
 constexpr const char *ROLE_USER         = "user";
 constexpr const char *ROLE_ASSISTANT    = "assistant";
 
-static std::vector<common_chat_msg> chat_msgs;
-static llama_pos system_prompt_position;
-static llama_pos current_position;
+static void reset_long_term_states(Lane &lane, const bool clear_kv_cache = true) {
+    lane.chat_msgs.clear();
+    lane.system_prompt_position = 0;
+    lane.current_position = 0;
 
-static void reset_long_term_states(const bool clear_kv_cache = true) {
-    chat_msgs.clear();
-    system_prompt_position = 0;
-    current_position = 0;
-
-    if (clear_kv_cache)
-        llama_memory_clear(llama_get_memory(g_context), false);
+    if (clear_kv_cache) {
+        // Only this lane's cells: llama_memory_clear() would wipe every lane.
+        llama_memory_seq_rm(llama_get_memory(g_context), lane.id, -1, -1);
+        lane.cached_tokens.clear();
+    }
 }
 
 /**
@@ -295,22 +390,34 @@ static void reset_long_term_states(const bool clear_kv_cache = true) {
  * - take half of the last (system_prompt_position - system_prompt_position) tokens
  * - recompute the logits in batches
  */
-static void shift_context() {
-    const int n_discard = (current_position - system_prompt_position) / 2;
-    LOGi("%s: Discarding %d tokens", __func__, n_discard);
-    llama_memory_seq_rm(llama_get_memory(g_context), 0, system_prompt_position, system_prompt_position + n_discard);
-    llama_memory_seq_add(llama_get_memory(g_context), 0, system_prompt_position + n_discard, current_position, -n_discard);
-    current_position -= n_discard;
-    LOGi("%s: Context shifting done! Current position: %d", __func__, current_position);
+static void shift_context(Lane &lane) {
+    const int n_discard = (lane.current_position - lane.system_prompt_position) / 2;
+    LOGi("%s: lane %d discarding %d tokens", __func__, lane.id, n_discard);
+    llama_memory_seq_rm(llama_get_memory(g_context), lane.id,
+                        lane.system_prompt_position, lane.system_prompt_position + n_discard);
+    llama_memory_seq_add(llama_get_memory(g_context), lane.id,
+                         lane.system_prompt_position + n_discard, lane.current_position, -n_discard);
+    lane.current_position -= n_discard;
+    // Mirror the same discard so the cache and its mirror stay in lockstep. A
+    // shift that cannot be mirrored exactly drops reuse rather than risk serving
+    // a prefix that no longer describes what is resident.
+    if ((int) lane.cached_tokens.size() >= lane.system_prompt_position + n_discard) {
+        lane.cached_tokens.erase(
+                lane.cached_tokens.begin() + lane.system_prompt_position,
+                lane.cached_tokens.begin() + lane.system_prompt_position + n_discard);
+    } else {
+        lane.cached_tokens.clear();
+    }
+    LOGi("%s: Context shifting done! Current position: %d", __func__, lane.current_position);
 }
 
-static std::string chat_add_and_format(const std::string &role, const std::string &content) {
+static std::string chat_add_and_format(Lane &lane, const std::string &role, const std::string &content) {
     common_chat_msg new_msg;
     new_msg.role = role;
     new_msg.content = content;
     auto formatted = common_chat_format_single(
-            g_chat_templates.get(), chat_msgs, new_msg, role == ROLE_USER, /* use_jinja */ true);
-    chat_msgs.push_back(new_msg);
+            g_chat_templates.get(), lane.chat_msgs, new_msg, role == ROLE_USER, /* use_jinja */ true);
+    lane.chat_msgs.push_back(new_msg);
     LOGi("%s: Formatted and added %s message: \n%s\n", __func__, role.c_str(), formatted.c_str());
     return formatted;
 }
@@ -321,17 +428,40 @@ static std::string chat_add_and_format(const std::string &role, const std::strin
  * - token chars caching
  * - current assistant message being generated
  */
-static llama_pos stop_generation_position;
-static std::string cached_token_chars;
-static std::ostringstream assistant_ss;
+static void reset_short_term_states(Lane &lane) {
+    lane.stop_generation_position = 0;
+    lane.cached_token_chars.clear();
+    lane.assistant_ss.str("");
+}
 
-static void reset_short_term_states() {
-    stop_generation_position = 0;
-    cached_token_chars.clear();
-    assistant_ss.str("");
+/**
+ * Records tokens just decoded into the KV cache at [start_pos, start_pos + n).
+ *
+ * The mirror is only sound if it describes the cache exactly, so a gap or an
+ * overlap invalidates it instead of silently desynchronising. Dropping it costs
+ * one full prefill on the next turn, which self-heals: processSystemPrompt then
+ * reuses nothing, clears the cache and records from position 0 again.
+ */
+static void cache_record(Lane &lane, const llama_tokens &tokens, const llama_pos start_pos) {
+    if (start_pos != (llama_pos) lane.cached_tokens.size()) {
+        LOGw("%s: lane %d KV mirror out of sync (decode at %d, mirror holds %d); dropping reuse",
+             __func__, lane.id, start_pos, (int) lane.cached_tokens.size());
+        lane.cached_tokens.clear();
+        return;
+    }
+    lane.cached_tokens.insert(lane.cached_tokens.end(), tokens.begin(), tokens.end());
+}
+
+/** Length of the longest shared prefix of two token sequences. */
+static size_t common_prefix_length(const llama_tokens &a, const llama_tokens &b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) { i++; }
+    return i;
 }
 
 static int decode_tokens_in_batches(
+        Lane &lane,
         llama_context *context,
         llama_batch &batch,
         const llama_tokens &tokens,
@@ -345,9 +475,9 @@ static int decode_tokens_in_batches(
         LOGv("%s: Preparing a batch size of %d starting at: %d", __func__, cur_batch_size, i);
 
         // Shift context if current batch cannot fit into the context
-        if (start_pos + i + cur_batch_size >= DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM) {
-            LOGw("%s: Current batch won't fit into context! Shifting...", __func__);
-            shift_context();
+        if (start_pos + i + cur_batch_size >= LANE_CONTEXT_SIZE - OVERFLOW_HEADROOM) {
+            LOGw("%s: Current batch won't fit into lane %d! Shifting...", __func__, lane.id);
+            shift_context(lane);
         }
 
         // Add tokens to the batch with proper positions
@@ -355,15 +485,23 @@ static int decode_tokens_in_batches(
             const llama_token token_id = tokens[i + j];
             const llama_pos position = start_pos + i + j;
             const bool want_logit = compute_last_logit && (i + j == tokens.size() - 1);
-            common_batch_add(batch, token_id, position, {0}, want_logit);
+            common_batch_add(batch, token_id, position, {lane.id}, want_logit);
         }
 
         // Decode this batch
         const int decode_result = llama_decode(context, batch);
         if (decode_result) {
             LOGe("%s: llama_decode failed w/ %d", __func__, decode_result);
+            // A failed decode leaves this lane's cells in an undefined state;
+            // neither they nor the mirror can be trusted as a prefix afterwards.
+            // Scoped to the lane so the other one survives.
+            llama_memory_seq_rm(llama_get_memory(context), lane.id, -1, -1);
+            lane.cached_tokens.clear();
             return 1;
         }
+        cache_record(lane,
+                     llama_tokens(tokens.begin() + i, tokens.begin() + i + cur_batch_size),
+                     start_pos + i);
     }
     return 0;
 }
@@ -373,12 +511,15 @@ JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         JNIEnv *env,
         jobject /*unused*/,
-        jstring jsystem_prompt
+        jstring jsystem_prompt,
+        jint jlane
 ) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
-    // Reset long-term & short-term states
-    reset_long_term_states();
-    reset_short_term_states();
+    Lane &lane = lane_at(jlane);
+    // Reset the chat-template bookkeeping and the per-turn state, but leave the
+    // KV cache resident: the prefill below reuses whatever prefix still matches.
+    reset_long_term_states(lane, /* clear_kv_cache */ false);
+    reset_short_term_states(lane);
 
     // Obtain system prompt from JEnv
     const auto *system_prompt = env->GetStringUTFChars(jsystem_prompt, nullptr);
@@ -388,7 +529,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
     // Format system prompt if applicable
     const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
     if (has_chat_template) {
-        formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, system_prompt);
+        formatted_system_prompt = chat_add_and_format(lane, ROLE_SYSTEM, system_prompt);
     }
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
 
@@ -400,9 +541,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
     }
 
     // Handle context overflow
-    const int max_batch_size = DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM;
+    const int max_batch_size = LANE_CONTEXT_SIZE - OVERFLOW_HEADROOM;
     if ((int) system_tokens.size() > max_batch_size) {
-        LOGe("%s: System prompt too long for context! %d tokens, max: %d",
+        LOGe("%s: System prompt too long for lane! %d tokens, max: %d",
              __func__, (int) system_tokens.size(), max_batch_size);
         return 1;
     }
@@ -419,14 +560,31 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         system_tokens.resize(MAX_SYSTEM_PREFILL_TOKENS);
     }
 
-    // Decode system tokens in batches
-    if (decode_tokens_in_batches(g_context, g_batch, system_tokens, current_position)) {
+    // Reuse the longest prefix of the resident cache that still matches this
+    // block. The Kotlin side rebuilds the whole thing every turn -- instructions,
+    // then "Conversation so far", then the how-to-reply close -- so turn N+1 is
+    // turn N's block with one more history entry spliced in before that close:
+    // everything up to the splice is already computed, and only the tail plus
+    // the close have to be decoded. A different conversation shares no prefix and
+    // falls back to a full prefill on its own.
+    const int n_reused = (int) common_prefix_length(lane.cached_tokens, system_tokens);
+    llama_memory_seq_rm(llama_get_memory(g_context), lane.id, n_reused, -1);
+    lane.cached_tokens.resize(n_reused);
+    lane.current_position = n_reused;
+
+    const llama_tokens pending(system_tokens.begin() + n_reused, system_tokens.end());
+    LOGi("%s: lane %d system prefill: %d tokens reused, %d to decode",
+         __func__, lane.id, n_reused, (int) pending.size());
+
+    // Decode whatever diverged, in batches
+    if (!pending.empty() &&
+        decode_tokens_in_batches(lane, g_context, g_batch, pending, lane.current_position)) {
         LOGe("%s: llama_decode() failed!", __func__);
         return 2;
     }
 
     // Update position
-    system_prompt_position = current_position = (int) system_tokens.size();
+    lane.system_prompt_position = lane.current_position = (int) system_tokens.size();
     return 0;
 }
 
@@ -436,11 +594,13 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
         JNIEnv *env,
         jobject /*unused*/,
         jstring juser_prompt,
-        jint n_predict
+        jint n_predict,
+        jint jlane
 ) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    Lane &lane = lane_at(jlane);
     // Reset short-term states
-    reset_short_term_states();
+    reset_short_term_states(lane);
 
     // Obtain and tokenize user prompt
     const auto *const user_prompt = env->GetStringUTFChars(juser_prompt, nullptr);
@@ -450,7 +610,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     // Format user prompt if applicable
     const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
     if (has_chat_template) {
-        formatted_user_prompt = chat_add_and_format(ROLE_USER, user_prompt);
+        formatted_user_prompt = chat_add_and_format(lane, ROLE_USER, user_prompt);
     }
     env->ReleaseStringUTFChars(juser_prompt, user_prompt);
 
@@ -462,7 +622,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
 
     // Ensure user prompt doesn't exceed the context size by truncating if necessary.
     const int original_user_prompt_size = (int) user_tokens.size();
-    const int max_batch_size = DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM;
+    const int max_batch_size = LANE_CONTEXT_SIZE - OVERFLOW_HEADROOM;
     if (original_user_prompt_size > max_batch_size) {
         const int skipped_tokens = original_user_prompt_size - max_batch_size;
         user_tokens.resize(max_batch_size);
@@ -470,15 +630,15 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     }
 
     // Decode user tokens in batches
-    if (decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true)) {
+    if (decode_tokens_in_batches(lane, g_context, g_batch, user_tokens, lane.current_position, true)) {
         LOGe("%s: llama_decode() failed!", __func__);
         return 2;
     }
 
     // Update position
     const int decoded_user_prompt_size = (int) user_tokens.size();
-    current_position += decoded_user_prompt_size;
-    stop_generation_position = current_position + n_predict;
+    lane.current_position += decoded_user_prompt_size;
+    lane.stop_generation_position = lane.current_position + n_predict;
     return 0;
 }
 
@@ -520,55 +680,58 @@ extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
         JNIEnv *env,
-        jobject /*unused*/
+        jobject /*unused*/,
+        jint jlane
 ) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    Lane &lane = lane_at(jlane);
     // Infinite text generation via context shifting
-    if (current_position >= DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM) {
-        LOGw("%s: Context full! Shifting...", __func__);
-        shift_context();
+    if (lane.current_position >= LANE_CONTEXT_SIZE - OVERFLOW_HEADROOM) {
+        LOGw("%s: Lane %d full! Shifting...", __func__, lane.id);
+        shift_context(lane);
     }
 
     // Stop if reaching the marked position
-    if (current_position >= stop_generation_position) {
-        LOGw("%s: STOP: hitting stop position: %d", __func__, stop_generation_position);
+    if (lane.current_position >= lane.stop_generation_position) {
+        LOGw("%s: STOP: hitting stop position: %d", __func__, lane.stop_generation_position);
         return nullptr;
     }
 
     // Sample next token
-    const auto new_token_id = common_sampler_sample(g_sampler, g_context, -1);
-    common_sampler_accept(g_sampler, new_token_id, true);
+    const auto new_token_id = common_sampler_sample(lane.sampler, g_context, -1);
+    common_sampler_accept(lane.sampler, new_token_id, true);
 
     // Populate the batch with new token, then decode
     common_batch_clear(g_batch);
-    common_batch_add(g_batch, new_token_id, current_position, {0}, true);
+    common_batch_add(g_batch, new_token_id, lane.current_position, {lane.id}, true);
     if (llama_decode(g_context, g_batch) != 0) {
         LOGe("%s: llama_decode() failed for generated token", __func__);
         return nullptr;
     }
 
     // Update position
-    current_position++;
+    cache_record(lane, {new_token_id}, lane.current_position);
+    lane.current_position++;
 
     // Stop if next token is EOG
     if (llama_vocab_is_eog(llama_model_get_vocab(g_model), new_token_id)) {
         LOGd("id: %d,\tIS EOG!\nSTOP.", new_token_id);
-        chat_add_and_format(ROLE_ASSISTANT, assistant_ss.str());
+        chat_add_and_format(lane, ROLE_ASSISTANT, lane.assistant_ss.str());
         return nullptr;
     }
 
     // If not EOG, convert to text
     auto new_token_chars = common_token_to_piece(g_context, new_token_id);
-    cached_token_chars += new_token_chars;
+    lane.cached_token_chars += new_token_chars;
 
     // Create and return a valid UTF-8 Java string
     jstring result = nullptr;
-    if (is_valid_utf8(cached_token_chars.c_str())) {
-        result = env->NewStringUTF(cached_token_chars.c_str());
-        LOGv("id: %d,\tcached: `%s`,\tnew: `%s`", new_token_id, cached_token_chars.c_str(), new_token_chars.c_str());
+    if (is_valid_utf8(lane.cached_token_chars.c_str())) {
+        result = env->NewStringUTF(lane.cached_token_chars.c_str());
+        LOGv("id: %d,\tcached: `%s`,\tnew: `%s`", new_token_id, lane.cached_token_chars.c_str(), new_token_chars.c_str());
 
-        assistant_ss << cached_token_chars;
-        cached_token_chars.clear();
+        lane.assistant_ss << lane.cached_token_chars;
+        lane.cached_token_chars.clear();
     } else {
         LOGv("id: %d,\tappend to cache", new_token_id);
         result = env->NewStringUTF("");
@@ -582,11 +745,18 @@ JNIEXPORT void JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, jobject /*unused*/) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
     // Reset long-term & short-term states
-    reset_long_term_states();
-    reset_short_term_states();
+    for (int i = 0; i < N_LANES; i++) {
+        reset_long_term_states(g_lanes[i]);
+        reset_short_term_states(g_lanes[i]);
+    }
 
     // Free up resources
-    common_sampler_free(g_sampler);
+    for (auto &lane : g_lanes) {
+        if (lane.sampler) {
+            common_sampler_free(lane.sampler);
+            lane.sampler = nullptr;
+        }
+    }
     g_chat_templates.reset();
     llama_batch_free(g_batch);
     llama_free(g_context);
