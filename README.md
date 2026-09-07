@@ -5,10 +5,13 @@ to the best available model (cloud-first, with a local GGUF fallback that runs
 entirely on the phone), drives real phone and smart-home actions through an
 explicit approval model, and keeps every secret in the Android Keystore.
 
-> **Status — v0.11.3 (2026-09-03).** Multi-agent orchestration, ~50 function-
+> **Status — v1.0.2 (2026-09-07).** Multi-agent orchestration, ~50 function-
 > calling tools, hybrid RAG, dual-store memory, on-device inference via
 > `llama.cpp`, in-app JS plugins, Telegram/Discord/Signal/WhatsApp gateways,
 > an embedded Home Assistant dashboard, and provider-side prompt caching.
+> v1.0.2 reworked on-device prefill: a long thread's chat turn went from
+> re-decoding 1531 tokens every turn to 899, and turns that hit an already-warm
+> cache decode nothing at all.
 > Signed release APKs are attached to each
 > [GitHub release](https://github.com/l3ad3r1/Hermes-Agent-Android/releases).
 
@@ -23,7 +26,7 @@ Hermes shares its engine with the private **Jeeves** super-app through the
 | Area | Detail |
 |------|--------|
 | **Model routing** | `HybridLlmRouter` ranks every configured cloud provider by quality, cost and latency, fails over in order, and only then falls back to the on-device model. A "primary / specialist" split sends simple turns to the fast model and reasoning-heavy turns to a stronger one. |
-| **On-device inference** | Llama 3.2 1B (or any user-supplied `.gguf`) runs through a pinned `llama.cpp` submodule (arm64-v8a, CMake/NDK). Unloads under memory pressure or after an idle timeout. |
+| **On-device inference** | Llama 3.2 1B (or any user-supplied `.gguf`) runs through a pinned `llama.cpp` submodule (arm64-v8a, CMake/NDK). Each turn reuses the longest token prefix already in the KV cache rather than re-prefilling the system block, and background work (the conversation brief) runs on a second KV lane so it cannot evict the conversation's cached prefix. Unloads under memory pressure or after an idle timeout. |
 | **Multi-agent orchestration** | `AgentRouter` → `OrchestratorImpl` builds a plan across five roles (Conversational, Productivity, Research, Device control, Creative) and runs a per-step tool-call loop with shared cross-agent context. Deterministic phone commands bypass the LLM entirely. |
 | **Tools (~50)** | Calendar, alarms, communication, media, navigation, device settings, camera, Home Assistant, web search/fetch, file read/write/patch, shell + Termux (behind biometrics), accessibility-driven screen automation, Kanban, memory, skills, delegation, and more. Two gates: per-role grants (`AgentToolAccess`) and a runtime execution policy (allow / confirm / deny by origin). |
 | **Memory & RAG** | Short-term sliding window plus a long-term semantic store (hybrid vector + BM25). A daily WorkManager pass consolidates facts while charging. Documents are chunked and indexed for retrieval. |
@@ -32,7 +35,7 @@ Hermes shares its engine with the private **Jeeves** super-app through the
 | **Proactivity** | Background heartbeat runs standing orders on a schedule (skips under Battery Saver / low battery), ambient presence beacon resolves your own labelled places without Play Services and discards the coordinate, digest + nudges with quiet hours and a ping budget. |
 | **Home Assistant** | Read/control entities with a per-category approval model (locks, covers, alarm panels always ask), plus an embedded dashboard: a token-seeded WebView on your HA URL with an optional Home-screen tile. |
 | **Security** | Provider keys and OAuth tokens are AES-256-GCM under a non-exportable Keystore key. TLS enforced everywhere. OAuth `state` verified. Plugin sandbox enforces an instruction-count deadline the plugin JS cannot catch. In-app security-audit panel. |
-| **Voice** | `SpeechRecognizer` input + `TextToSpeech` output, hands-free Talk mode (on-device recogniser, voice-activated barge-in). |
+| **Voice** | `SpeechRecognizer` input + `TextToSpeech` output, hands-free Talk mode (on-device recogniser, voice-activated barge-in). In the chat composer the microphone runs a hands-free session on tap — listen, answer aloud, listen again — and plain dictation on long-press. |
 | **UI** | Jetpack Compose + Material 3, OLED-monochrome theme, two-row chat composer with an in-line reasoning-effort control, auto-generated conversation titles, five-group Settings, onboarding, full accessibility strings, es/fr/de/ja/zh-CN localization. |
 
 ## Removed / not present

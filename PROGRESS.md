@@ -1,5 +1,74 @@
 # Hermes Agent — Progress
 
+## v1.0.2 (2026-09-07) — on-device prefill stops being re-done every turn
+
+A local turn was dominated by prefill that should not have been happening.
+Measured on a Galaxy S24 Ultra with Qwen2.5 1.5B on a long thread, a chat turn's
+prefill went from **1531 tokens / ~24 s every turn** to **899 tokens / ~9-15 s**,
+and turns that hit an already-warm cache now decode **nothing at all**
+(`1536 tokens reused, 0 to decode`, seen in the signed release build).
+
+Five separate causes, each of which alone kept the cache cold:
+
+**The system block was re-prefilled every turn.** `processSystemPrompt` cleared
+the KV cache and decoded the whole block from scratch, because the Kotlin side
+rebuilds that block on every call by design. It now reuses the longest matching
+token prefix, tracked by a per-lane mirror of what is actually resident.
+
+**Per-turn recall sat in front of the history.** Memory, RAG and skill-match
+results are retrieved against the current message, so they differ every turn.
+Putting them before the conversation meant the first differing token landed at
+the end of the instructions and the entire history was decoded again. They now
+sit after it.
+
+**The history window slid by one entry per turn.** Dropping exactly as many old
+entries as the budget required moves the front of the history — which is where
+the reusable prefix ends. Prefix retention collapsed from 86% to 24% the turn a
+conversation outgrew `maxConversationChars`, and stayed there. Drops are now
+rounded up to a quantum so the front holds still for a run of turns.
+
+**The conversation brief was re-summarised every turn.** `ConversationCompressor`
+keyed its cache on the newest *older* message — an anchor that advances every
+turn — so the cache could never hit. The brief is now maintained incrementally:
+turns it does not yet cover ride along verbatim (free, and nothing is lost), and
+are folded in by summarising *brief + tail only* once the tail is worth an
+inference. Merge cost no longer grows with thread length.
+
+**Background inference evicted the chat cache.** The brief's prompt and the chat
+prompt share about five tokens, so every summarisation left the next chat turn
+starting cold. `ai_chat.cpp` now runs two KV lanes — llama.cpp sequence ids —
+and background work has its own. `n_seq_max = 2` with `kv_unified = false`
+splits the context that was already allocated, so this costs **no extra KV
+memory**; anything reasoning about one conversation's room uses
+`LANE_CONTEXT_SIZE`. The lane is chosen by an `AuxiliaryInference` coroutine
+context element rather than a parameter, because the call reaches the engine
+through the provider-agnostic `LlmProvider` that cloud providers implement too.
+
+Also: `n_ubatch` was pinned to 64 as an Adreno `vk::DeviceLostError` workaround.
+Vulkan is compiled out and every decode runs on the CPU, so that cap was
+splitting each 512-token prefill chunk into eight passes for nothing; restored to
+`n_batch`. And `n_gpu_layers` was a hardcoded 0 — it now follows the backends
+that actually registered, so a CPU-only build is unchanged and enabling offload
+needs no second code change.
+
+**Voice.** The round send button wears a keyboard-return glyph, and with an empty
+field it started voice chat: a stray tap on what reads as Enter dropped the user
+into a talking session. It is send/stop only now. The hands-free loop already
+existed in `ChatViewModel` and was simply bound to the wrong control — it moves
+to the microphone, where a tap runs the session and a long-press keeps plain
+dictation (the only way to speak a message *without* being answered aloud).
+
+**Not enabled:** OpenCL offload for Adreno is wired behind an `OPENCL_SDK` env
+var and is off by default. Upstream verifies Adreno 750 and supports Q4_K, so the
+existing catalogue would work unchanged, but it has never been built or run — see
+`docs/BUILD.md` 4a.
+
+**Known remaining cost:** a turn that uses the tool caller swaps GGUF between the
+tool-caller and chat models, and only one model fits in the process, so the
+reload builds a new context and both lanes go with it. Lanes cannot help there —
+it is a different model, not a different prompt. That is now the largest single
+cost on a local turn.
+
 ## v0.11.3 (2026-09-02) — the OpenClaw phases are now actually wired
 
 The 2026-09-02 functional audit found three phases were dead code: a complete
