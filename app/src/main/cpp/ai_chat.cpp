@@ -94,6 +94,7 @@ struct Lane {
  * another's model, context or KV lanes.
  */
 struct Slot {
+    int                        id = 0;
     llama_model              * model = nullptr;
     llama_context            * context = nullptr;
     llama_batch                batch{};
@@ -104,8 +105,14 @@ struct Slot {
 
 static Slot g_slots[N_SLOTS];
 
+/** Stamps each slot with its own index once, so logs can name it. */
+static void ensure_slot_ids() {
+    for (int i = 0; i < N_SLOTS; i++) { g_slots[i].id = i; }
+}
+
 /** Falls back to the conversation slot rather than trusting an out-of-range id. */
 static Slot &slot_at(const int index) {
+    ensure_slot_ids();
     if (index < 0 || index >= N_SLOTS) {
         LOGw("%s: slot %d out of range; using the conversation slot", __func__, index);
         return g_slots[SLOT_CHAT];
@@ -177,8 +184,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     // with Vulkan compiled out it stays 0 on a CPU-only build and only lifts once
     // an OpenCL backend .so actually loads (see OPENCL_SDK in app/build.gradle.kts).
     model_params.n_gpu_layers = has_gpu_backend() ? GPU_OFFLOAD_LAYERS : 0;
-    LOGi("%s: backends=[%s], offloading %d layers",
-         __func__, get_backend().c_str(), model_params.n_gpu_layers);
+    LOGi("%s: slot %d backends=[%s], offloading %d layers",
+         __func__, slot.id, get_backend().c_str(), model_params.n_gpu_layers);
     model_params.use_mmap = true;
 
     const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
@@ -610,8 +617,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
     lane.current_position = n_reused;
 
     const llama_tokens pending(system_tokens.begin() + n_reused, system_tokens.end());
-    LOGi("%s: lane %d system prefill: %d tokens reused, %d to decode",
-         __func__, lane.id, n_reused, (int) pending.size());
+    LOGi("%s: slot %d lane %d system prefill: %d tokens reused, %d to decode",
+         __func__, slot.id, lane.id, n_reused, (int) pending.size());
 
     // Decode whatever diverged, in batches
     if (!pending.empty() &&
