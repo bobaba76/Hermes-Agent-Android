@@ -2,7 +2,9 @@ package com.hermes.agent.ui.chat.components
 import com.hermes.agent.domain.settings.*
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -13,6 +15,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.text.BasicTextField
@@ -82,6 +85,7 @@ internal fun shortModelName(raw: String): String {
  * a reasoning-effort button (with a slider inside), and send/stop/voice on the
  * right.
  */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ChatInputBar(
     isSending: Boolean,
@@ -105,6 +109,7 @@ fun ChatInputBar(
     var effortMenuOpen by remember { mutableStateOf(false) }
     val listeningDescription = stringResource(R.string.a11y_listening)
     val endVoiceChatDescription = stringResource(R.string.a11y_end_voice_chat)
+    val startVoiceChatDescription = stringResource(R.string.a11y_start_voice_chat)
 
     val imagePickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
         contract = androidx.activity.result.contract.ActivityResultContracts.GetContent(),
@@ -215,57 +220,50 @@ fun ChatInputBar(
 
                 Spacer(Modifier.size(4.dp))
 
-                // Send / stop / voice — colour shifts with state, the shape and
+                // Send / stop — colour shifts with state, the shape and
                 // keyboard-return glyph stay constant. Stop is red; see
                 // HermesPalette.Stop.
+                //
+                // This button used to start voice chat whenever the field was
+                // empty, so a stray tap on what reads as Enter dropped the user
+                // into a talking session. Voice chat lives on the microphone
+                // now; with nothing to send this does nothing.
                 val hasText = text.isNotBlank()
+                val canSend = hasText || attachedImageUri != null
                 val actionColor = when {
                     isSending -> HermesPalette.Stop
-                    voiceChatActive -> MaterialTheme.colorScheme.error
-                    hasText -> MaterialTheme.colorScheme.primary
+                    canSend -> MaterialTheme.colorScheme.primary
                     else -> MaterialTheme.colorScheme.surfaceVariant
                 }
                 Surface(
                     onClick = when {
                         isSending -> onCancel
-                        hasText -> ::submit
-                        else -> onVoiceChatToggle
+                        canSend -> ::submit
+                        else -> ({})
                     },
                     modifier = Modifier.size(40.dp),
                     shape = RoundedCornerShape(20.dp),
                     color = actionColor,
                     contentColor = when {
                         isSending -> HermesPalette.OnStop
-                        voiceChatActive -> MaterialTheme.colorScheme.onError
-                        hasText -> MaterialTheme.colorScheme.onPrimary
+                        canSend -> MaterialTheme.colorScheme.onPrimary
                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                     },
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        if (voiceChatActive) {
-                            ThinkingOrb(
-                                diameter = 26.dp,
-                                color = MaterialTheme.colorScheme.onError,
-                                listening = isListening,
-                                modifier = Modifier.semantics {
-                                    contentDescription = endVoiceChatDescription
-                                },
-                            )
-                        } else {
-                            Icon(
-                                imageVector = if (isSending) {
-                                    Icons.Outlined.Stop
-                                } else {
-                                    Icons.AutoMirrored.Outlined.KeyboardReturn
-                                },
-                                contentDescription = when {
-                                    isSending -> stringResource(R.string.a11y_stop_generating)
-                                    hasText -> stringResource(R.string.a11y_send_button)
-                                    else -> stringResource(R.string.a11y_start_voice_chat)
-                                },
-                                modifier = Modifier.size(22.dp),
-                            )
-                        }
+                        Icon(
+                            imageVector = if (isSending) {
+                                Icons.Outlined.Stop
+                            } else {
+                                Icons.AutoMirrored.Outlined.KeyboardReturn
+                            },
+                            contentDescription = if (isSending) {
+                                stringResource(R.string.a11y_stop_generating)
+                            } else {
+                                stringResource(R.string.a11y_send_button)
+                            },
+                            modifier = Modifier.size(22.dp),
+                        )
                     }
                 }
             }
@@ -322,15 +320,37 @@ fun ChatInputBar(
 
                     // Pulled in tight against the + so the two read as one
                     // cluster rather than evenly-spaced toolbar buttons.
-                    IconButton(
-                        onClick = onMicToggle,
-                        modifier = Modifier.size(40.dp).offset(x = (-10).dp),
+                    // Tap starts (and ends) the hands-free session: Hermes
+                    // listens, answers aloud, then listens again with nothing
+                    // touched. Long-press is plain dictation — one utterance
+                    // typed into the field to edit and send — which was the old
+                    // tap behaviour, kept because it is the only way to speak a
+                    // message without also being answered out loud.
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .offset(x = (-10).dp)
+                            .clip(CircleShape)
+                            .combinedClickable(
+                                onClick = onVoiceChatToggle,
+                                onLongClick = onMicToggle,
+                            ),
+                        contentAlignment = Alignment.Center,
                     ) {
                         // While the mic is hot the icon becomes the orb, so voice
                         // capture reads as the same "Hermes is busy" language as
-                        // the chat bubble. Not during voice chat, though — that
-                        // mode already shows an orb on the round button.
-                        if (isListening && !voiceChatActive) {
+                        // the chat bubble. In voice chat it is tinted as the stop
+                        // affordance, since tapping again ends the session.
+                        if (voiceChatActive) {
+                            ThinkingOrb(
+                                diameter = 24.dp,
+                                color = MaterialTheme.colorScheme.error,
+                                listening = isListening,
+                                modifier = Modifier.semantics {
+                                    contentDescription = endVoiceChatDescription
+                                },
+                            )
+                        } else if (isListening) {
                             ThinkingOrb(
                                 diameter = 24.dp,
                                 listening = true,
@@ -341,7 +361,7 @@ fun ChatInputBar(
                         } else {
                             Icon(
                                 imageVector = Icons.Outlined.Mic,
-                                contentDescription = stringResource(R.string.a11y_voice_input),
+                                contentDescription = startVoiceChatDescription,
                                 tint = MaterialTheme.colorScheme.onSurface,
                             )
                         }

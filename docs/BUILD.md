@@ -146,6 +146,80 @@ See `docs/ARCHITECTURE.md` § 7 for the diagram of the swap.
 
 ---
 
+## 4a. GPU offload via OpenCL (opt-in, unverified on device)
+
+Decoding runs on the CPU. `GGML_VULKAN` is off because Vulkan offload triggered
+`vk::DeviceLostError` (TDR) on Adreno, and `n_gpu_layers` follows whatever
+backends actually registered — with no GPU backend built in, that is 0 and
+nothing changes.
+
+llama.cpp's **OpenCL** backend is the more promising route on Adreno: upstream
+lists Adreno 750 (Snapdragon 8 Gen 3) as verified, and it supports Q4_K, so the
+existing Q4_K_M catalogue works unchanged. It is wired up but **off unless
+`OPENCL_SDK` is set**, and it has not yet run on real Adreno hardware.
+
+### Providing an SDK
+
+The NDK sysroot ships neither the CL headers nor a `libOpenCL.so` to link
+against, so both are pointed at explicitly. Expected layout:
+
+```
+$OPENCL_SDK/
+  include/CL/*.h                 # github.com/KhronosGroup/OpenCL-Headers
+  lib/arm64-v8a/libOpenCL.so     # github.com/KhronosGroup/OpenCL-ICD-Loader,
+                                 # built with the NDK toolchain for arm64-v8a
+```
+
+Build the loader with the NDK toolchain file, `-DANDROID_ABI=arm64-v8a` and
+`-DANDROID_PLATFORM=24`; see `app/src/main/cpp/llama.cpp/docs/backend/OPENCL.md`
+for upstream's version of these steps. A host Python 3 is also required — the
+Adreno kernels are embedded into the backend at build time.
+
+That `libOpenCL.so` is a **link-time stub only** and is not packaged into the
+APK. On device the loader resolves the soname to the vendor's own
+`/vendor/lib64/libOpenCL.so`, which is the real Adreno driver. Confirm it is
+exported to apps before relying on this:
+
+```bash
+adb shell grep -r OpenCL /vendor/etc/public.libraries.txt
+```
+
+### Building and verifying
+
+```bash
+OPENCL_SDK=/path/to/opencl-sdk ./gradlew :app:assembleDebug
+```
+
+An extra `libggml-opencl.so` in the APK's `lib/arm64-v8a/` means the backend
+compiled. To confirm it is live rather than merely present, check the load line
+at model load — it reports the registered backends and the layer count:
+
+```bash
+adb logcat -s ai_chat | grep 'offloading'
+```
+
+`backends=[CPU], offloading 0 layers` means the backend did not register and you
+are still on the CPU.
+
+### Failure modes
+
+Building this in is safe on non-Adreno hardware. The backend is a separate
+`.so` loaded through `GGML_BACKEND_DL`, and `ggml_backend_load_best()` skips one
+it cannot load instead of failing, so devices without a usable driver fall back
+to the CPU — silently, since release builds define `NDEBUG`.
+
+What that does **not** cover is a driver that loads and then faults mid-matmul,
+which is exactly how the Vulkan attempt died. Two things to re-test if offload
+goes live: `n_ubatch` (uncapped from 64 back to `BATCH_SIZE` once decoding moved
+to the CPU — the 64 was an Adreno TDR workaround) and sustained multi-turn
+generation, not just a single reply.
+
+A Hexagon NPU backend (`ggml/src/ggml-hexagon`) also exists in-tree and is
+faster still, but it is marked experimental, is Q4_0-only — which would mean
+re-quantising the catalogue — and needs the Hexagon SDK at build time.
+
+---
+
 ## 5. Release builds
 
 Every published release ships a signed APK whose signer SHA-256 begins

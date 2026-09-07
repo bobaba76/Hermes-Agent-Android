@@ -201,13 +201,10 @@ class ChatRepositoryImpl @Inject constructor(
         )
         val recent = scanned.takeLast(CONTEXT_WINDOW_MESSAGES)
         val older = scanned.dropLast(CONTEXT_WINDOW_MESSAGES)
-        val brief = older.lastOrNull()?.let { anchor ->
-            compressor.brief(
-                conversationId,
-                older.map { LlmMessage(role = it.role.wireName, content = it.content) },
-                anchor.id,
-            )
-        }
+        val brief = compressor.brief(
+            conversationId,
+            older.map { LlmMessage(role = it.role.wireName, content = it.content) },
+        )
         val llmMessages = buildList {
             // Orchestrator supplies its own system prompt per agent, so we
             // only include conversation turns (plus the earlier-context brief).
