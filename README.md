@@ -5,13 +5,14 @@ to the best available model (cloud-first, with a local GGUF fallback that runs
 entirely on the phone), drives real phone and smart-home actions through an
 explicit approval model, and keeps every secret in the Android Keystore.
 
-> **Status — v1.0.2 (2026-09-07).** Multi-agent orchestration, ~50 function-
+> **Status — v1.0.3 (2026-09-08).** Multi-agent orchestration, ~50 function-
 > calling tools, hybrid RAG, dual-store memory, on-device inference via
 > `llama.cpp`, in-app JS plugins, Telegram/Discord/Signal/WhatsApp gateways,
 > an embedded Home Assistant dashboard, and provider-side prompt caching.
 > v1.0.2 reworked on-device prefill: a long thread's chat turn went from
 > re-decoding 1531 tokens every turn to 899, and turns that hit an already-warm
-> cache decode nothing at all.
+> cache decode nothing at all. v1.0.3 gives each model role its own slot, so an
+> on-device tool call no longer evicts the chat model and its cache.
 > Signed release APKs are attached to each
 > [GitHub release](https://github.com/l3ad3r1/Hermes-Agent-Android/releases).
 

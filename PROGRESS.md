@@ -1,5 +1,46 @@
 # Hermes Agent — Progress
 
+## v1.0.3 (2026-09-08) — a tool call no longer evicts the chat model
+
+v1.0.2 stopped the chat cache being thrown away every turn. One thing could
+still throw it away: the on-device tool caller.
+
+**The bug.** The native engine held a single `llama_model`/`llama_context` pair.
+The tool caller is a *different* model (FunctionGemma 270M) from the chat model,
+so every tool turn unloaded the chat GGUF to load its own — and the following
+chat turn reloaded the chat GGUF and prefilled from nothing. The KV lanes added
+in v1.0.2 could not help: a lane subdivides one model's context, and this needs
+two models resident.
+
+**The fix.** Everything that was global in `ai_chat.cpp` now lives in a `Slot`,
+and each role gets one. Lanes nest inside slots, so each model keeps its own chat
+and auxiliary sequences.
+
+Unlike lanes, two slots really do cost memory — two sets of weights, two KV
+caches — so it is gated on available RAM. A device without the headroom keeps the
+previous swap-one-model-in-and-out behaviour rather than thrashing.
+
+Measured on a Galaxy S24 Ultra, Qwen2.5 1.5B chat model plus the tool caller,
+both resident: a chat turn that also ran a tool call reused **741 of 778 tokens**
+with **zero GGUF reloads**, where before the same turn started completely cold.
+App RSS was ~2.9 GB of 11 GB with MemAvailable steady at ~2.8 GB and no
+lowmemorykiller activity; the weights are mmap'd, so most of that is file-backed
+and reclaimable.
+
+**The sharp edge that came with it.** Separate slots mean unloading the chat
+model no longer unloads the tool caller — so a setting that invalidates *both*
+has to say so. Moving the model download folder is the only one that does, since
+both GGUFs live there; picking a chat model leaves the tool caller resident on
+purpose, because unloading it would buy a reload on the next tool turn for
+nothing. Nothing fails loudly if this is wrong — the tool caller would simply go
+on serving a model from a folder that had moved — so it is pinned by tests and
+was checked on device: touching the folder reloads both slots, picking a model
+reloads only the chat one.
+
+The prefill and load log lines now name the slot, without which a tool-caller
+prefill reads exactly like a chat one. `docs/LOCAL-INFERENCE-PERF.md` §6 has the
+detail and the invariants.
+
 ## v1.0.2 (2026-09-07) — on-device prefill stops being re-done every turn
 
 A local turn was dominated by prefill that should not have been happening.
