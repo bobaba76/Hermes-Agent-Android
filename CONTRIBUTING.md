@@ -165,8 +165,10 @@ Not applied today because the endpoint is user-configurable. Opt-in pinning for
 fixed-provider users. Self-contained; a good first security PR.
 
 ### gRPC plugin sandbox ([#6](https://github.com/l3ad3r1/Hermes-Agent-Android/issues/6))
-`GrpcPluginSandbox` is an interface stub; real process isolation for third-party
-plugins.
+`GrpcPluginSandbox` and the registry are real and DI-bound, but
+`GrpcPluginTransportModule` declares the transport set with `@Multibinds` and
+nothing implements it, so every plugin runs in-process with full access to app
+memory. The missing piece is a transport implementation, not the sandbox.
 
 ---
 

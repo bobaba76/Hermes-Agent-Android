@@ -287,7 +287,7 @@ Tiny utilities shared across layers.
 | File                          | Type                | Purpose                                                            |
 |-------------------------------|---------------------|--------------------------------------------------------------------|
 | `InProcessPluginSandbox.kt`   | `class` (Singleton) | Real sandbox for first-party plugins; loads in-process, registers tools on load. |
-| `GrpcPluginSandbox.kt`        | `class` (Singleton) | Interface stub for third-party APK plugins via gRPC; `isAvailable` returns false in Phase 3. |
+| `GrpcPluginSandbox.kt`        | `class` (Singleton) | Real sandbox delegating to injected `GrpcPluginTransport`s. No transport is bound in either app (`GrpcPluginTransportModule` is an empty `@Multibinds` set), so loads fail cleanly and plugins run in-process. |
 | `PluginRegistryImpl.kt`       | `class` (Singleton) | In-memory registry; auto-installs first-party plugins.             |
 | `PluginResourceMonitor.kt`    | `class` (Singleton) | Per-plugin CPU/memory polling per Section 3.3 of the plan.         |
 | `HostPluginContext.kt`        | `class` (Singleton) | `PluginContext` impl exposing controlled host services.            |
