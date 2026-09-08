@@ -38,6 +38,16 @@ constexpr int   N_THREADS_HEADROOM      = 2;
 // n_ctx / n_seq_max — so this costs no extra KV memory, it partitions what was
 // already allocated. Anything reasoning about a single conversation's room must
 // therefore use LANE_CONTEXT_SIZE, not the total.
+// One model slot per role. They used to share a single set of globals, so
+// asking for the tool caller evicted the chat model — a new llama_context, and
+// with it both KV lanes, every time a turn used a tool. Slots let each role keep
+// its own model, context and lanes resident; the Kotlin side decides whether
+// there is RAM for that (see LocalLlmManager) and falls back to evicting when
+// there is not.
+constexpr int   N_SLOTS                 = 2;
+constexpr int   SLOT_CHAT               = 0;
+constexpr int   SLOT_TOOL_CALLER        = 1;
+
 constexpr int   N_LANES                 = 2;
 constexpr int   LANE_CHAT               = 0;
 constexpr int   LANE_AUX                = 1;
@@ -55,10 +65,6 @@ constexpr int   GPU_OFFLOAD_LAYERS      = 99;
 constexpr int   MAX_SYSTEM_PREFILL_TOKENS = 1536;
 constexpr float DEFAULT_SAMPLER_TEMP    = 0.3f;
 
-static llama_model                      * g_model;
-static llama_context                    * g_context;
-static llama_batch                        g_batch;
-static common_chat_templates_ptr          g_chat_templates;
 
 /**
  * Everything that belongs to one conversation-in-flight.
@@ -81,15 +87,46 @@ struct Lane {
     common_sampler               * sampler = nullptr;
 };
 
-static Lane g_lanes[N_LANES];
+/**
+ * One loaded model and everything that belongs to it.
+ *
+ * Slots are independent: loading, unloading or decoding in one cannot disturb
+ * another's model, context or KV lanes.
+ */
+struct Slot {
+    int                        id = 0;
+    llama_model              * model = nullptr;
+    llama_context            * context = nullptr;
+    llama_batch                batch{};
+    bool                       batch_ready = false;
+    common_chat_templates_ptr  chat_templates;
+    Lane                       lanes[N_LANES];
+};
+
+static Slot g_slots[N_SLOTS];
+
+/** Stamps each slot with its own index once, so logs can name it. */
+static void ensure_slot_ids() {
+    for (int i = 0; i < N_SLOTS; i++) { g_slots[i].id = i; }
+}
+
+/** Falls back to the conversation slot rather than trusting an out-of-range id. */
+static Slot &slot_at(const int index) {
+    ensure_slot_ids();
+    if (index < 0 || index >= N_SLOTS) {
+        LOGw("%s: slot %d out of range; using the conversation slot", __func__, index);
+        return g_slots[SLOT_CHAT];
+    }
+    return g_slots[index];
+}
 
 /** Falls back to the conversation lane rather than trusting an out-of-range id. */
-static Lane &lane_at(const int index) {
+static Lane &lane_at(Slot &slot, const int index) {
     if (index < 0 || index >= N_LANES) {
         LOGw("%s: lane %d out of range; using the conversation lane", __func__, index);
-        return g_lanes[LANE_CHAT];
+        return slot.lanes[LANE_CHAT];
     }
-    return g_lanes[index];
+    return slot.lanes[index];
 }
 
 // Secondary defense layer behind the Kotlin coroutine dispatcher
@@ -138,16 +175,17 @@ static bool has_gpu_backend() {
 
 extern "C"
 JNIEXPORT jint JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstring jmodel_path, jint jslot) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    Slot &slot = slot_at(jslot);
     llama_model_params model_params = llama_model_default_params();
     // Offload everything when a GPU backend registered, nothing otherwise. This
     // sat at a hard 0 because Vulkan offload triggered DeviceLostError on Adreno;
     // with Vulkan compiled out it stays 0 on a CPU-only build and only lifts once
     // an OpenCL backend .so actually loads (see OPENCL_SDK in app/build.gradle.kts).
     model_params.n_gpu_layers = has_gpu_backend() ? GPU_OFFLOAD_LAYERS : 0;
-    LOGi("%s: backends=[%s], offloading %d layers",
-         __func__, get_backend().c_str(), model_params.n_gpu_layers);
+    LOGi("%s: slot %d backends=[%s], offloading %d layers",
+         __func__, slot.id, get_backend().c_str(), model_params.n_gpu_layers);
     model_params.use_mmap = true;
 
     const auto *model_path = env->GetStringUTFChars(jmodel_path, 0);
@@ -158,7 +196,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     if (!model) {
         return 1;
     }
-    g_model = model;
+    slot.model = model;
     return 0;
 }
 
@@ -201,34 +239,36 @@ static llama_context *init_context(llama_model *model,
     ctx_params.n_ubatch = BATCH_SIZE;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
-    auto *context = llama_init_from_model(g_model, ctx_params);
+    auto *context = llama_init_from_model(model, ctx_params);
     if (context == nullptr) {
         LOGe("%s: llama_new_context_with_model() returned null)", __func__);
     }
     return context;
 }
 
-static common_sampler *new_sampler(float temp) {
+static common_sampler *new_sampler(llama_model *model, float temp) {
     common_params_sampling sparams;
     sparams.temp = temp;
-    return common_sampler_init(g_model, sparams);
+    return common_sampler_init(model, sparams);
 }
 
 extern "C"
 JNIEXPORT jint JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv * /*env*/, jobject /*unused*/) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv * /*env*/, jobject /*unused*/, jint jslot) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
-    auto *context = init_context(g_model);
+    Slot &slot = slot_at(jslot);
+    auto *context = init_context(slot.model);
     if (!context) { return 1; }
-    g_context = context;
+    slot.context = context;
     // A batch entry has to be able to name the lane it belongs to.
-    g_batch = llama_batch_init(BATCH_SIZE, 0, N_LANES);
-    g_chat_templates = common_chat_templates_init(g_model, "");
+    slot.batch = llama_batch_init(BATCH_SIZE, 0, N_LANES);
+    slot.chat_templates = common_chat_templates_init(slot.model, "");
+    slot.batch_ready = true;
     for (int i = 0; i < N_LANES; i++) {
-        Lane &lane = g_lanes[i];
+        Lane &lane = slot.lanes[i];
         lane = Lane{};                       // new context, nothing resident
         lane.id = i;
-        lane.sampler = new_sampler(DEFAULT_SAMPLER_TEMP);
+        lane.sampler = new_sampler(slot.model, DEFAULT_SAMPLER_TEMP);
     }
     return 0;
 }
@@ -254,11 +294,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_systemInfo(JNIEnv *env, jobject
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject /*unused*/, jint pp, jint tg,
-                                                      jint pl, jint nr) {
+                                                      jint pl, jint nr, jint jslot) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    Slot &slot = slot_at(jslot);
     // Single sequence: the benchmark wants the whole pp-token window to itself,
     // not the per-lane split the chat context uses.
-    auto *context = init_context(g_model, pp, /* n_seq_max */ 1);
+    auto *context = init_context(slot.model, pp, /* n_seq_max */ 1);
     if (!context) {
         const auto *const err_msg = "Fail to init_context! Bench aborted.";
         LOGe(err_msg);
@@ -278,18 +319,18 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
     for (nri = 0; nri < nr; nri++) {
         LOGi("Benchmark prompt processing (pp = %d)", pp);
 
-        common_batch_clear(g_batch);
+        common_batch_clear(slot.batch);
 
         const int n_tokens = pp;
         for (i = 0; i < n_tokens; i++) {
-            common_batch_add(g_batch, 0, i, {0}, false);
+            common_batch_add(slot.batch, 0, i, {0}, false);
         }
 
-        g_batch.logits[g_batch.n_tokens - 1] = true;
+        slot.batch.logits[slot.batch.n_tokens - 1] = true;
         llama_memory_clear(llama_get_memory(context), false);
 
         const auto t_pp_start = ggml_time_us();
-        if (llama_decode(context, g_batch) != 0) {
+        if (llama_decode(context, slot.batch) != 0) {
             LOGe("llama_decode() failed during prompt processing");
         }
         const auto t_pp_end = ggml_time_us();
@@ -301,12 +342,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
         llama_memory_clear(llama_get_memory(context), false);
         const auto t_tg_start = ggml_time_us();
         for (i = 0; i < tg; i++) {
-            common_batch_clear(g_batch);
+            common_batch_clear(slot.batch);
             for (j = 0; j < pl; j++) {
-                common_batch_add(g_batch, 0, i, {j}, true);
+                common_batch_add(slot.batch, 0, i, {j}, true);
             }
 
-            if (llama_decode(context, g_batch) != 0) {
+            if (llama_decode(context, slot.batch) != 0) {
                 LOGe("llama_decode() failed during text generation");
             }
         }
@@ -343,10 +384,10 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_benchModel(JNIEnv *env, jobject
     }
 
     char model_desc[128];
-    llama_model_desc(g_model, model_desc, sizeof(model_desc));
+    llama_model_desc(slot.model, model_desc, sizeof(model_desc));
 
-    const auto model_size = double(llama_model_size(g_model)) / 1024.0 / 1024.0 / 1024.0;
-    const auto model_n_params = double(llama_model_n_params(g_model)) / 1e9;
+    const auto model_size = double(llama_model_size(slot.model)) / 1024.0 / 1024.0 / 1024.0;
+    const auto model_n_params = double(llama_model_n_params(slot.model)) / 1e9;
 
     const auto backend = get_backend();
     std::stringstream result;
@@ -370,14 +411,14 @@ constexpr const char *ROLE_SYSTEM       = "system";
 constexpr const char *ROLE_USER         = "user";
 constexpr const char *ROLE_ASSISTANT    = "assistant";
 
-static void reset_long_term_states(Lane &lane, const bool clear_kv_cache = true) {
+static void reset_long_term_states(Slot &slot, Lane &lane, const bool clear_kv_cache = true) {
     lane.chat_msgs.clear();
     lane.system_prompt_position = 0;
     lane.current_position = 0;
 
     if (clear_kv_cache) {
         // Only this lane's cells: llama_memory_clear() would wipe every lane.
-        llama_memory_seq_rm(llama_get_memory(g_context), lane.id, -1, -1);
+        llama_memory_seq_rm(llama_get_memory(slot.context), lane.id, -1, -1);
         lane.cached_tokens.clear();
     }
 }
@@ -390,12 +431,12 @@ static void reset_long_term_states(Lane &lane, const bool clear_kv_cache = true)
  * - take half of the last (system_prompt_position - system_prompt_position) tokens
  * - recompute the logits in batches
  */
-static void shift_context(Lane &lane) {
+static void shift_context(Slot &slot, Lane &lane) {
     const int n_discard = (lane.current_position - lane.system_prompt_position) / 2;
     LOGi("%s: lane %d discarding %d tokens", __func__, lane.id, n_discard);
-    llama_memory_seq_rm(llama_get_memory(g_context), lane.id,
+    llama_memory_seq_rm(llama_get_memory(slot.context), lane.id,
                         lane.system_prompt_position, lane.system_prompt_position + n_discard);
-    llama_memory_seq_add(llama_get_memory(g_context), lane.id,
+    llama_memory_seq_add(llama_get_memory(slot.context), lane.id,
                          lane.system_prompt_position + n_discard, lane.current_position, -n_discard);
     lane.current_position -= n_discard;
     // Mirror the same discard so the cache and its mirror stay in lockstep. A
@@ -411,12 +452,12 @@ static void shift_context(Lane &lane) {
     LOGi("%s: Context shifting done! Current position: %d", __func__, lane.current_position);
 }
 
-static std::string chat_add_and_format(Lane &lane, const std::string &role, const std::string &content) {
+static std::string chat_add_and_format(Slot &slot, Lane &lane, const std::string &role, const std::string &content) {
     common_chat_msg new_msg;
     new_msg.role = role;
     new_msg.content = content;
     auto formatted = common_chat_format_single(
-            g_chat_templates.get(), lane.chat_msgs, new_msg, role == ROLE_USER, /* use_jinja */ true);
+            slot.chat_templates.get(), lane.chat_msgs, new_msg, role == ROLE_USER, /* use_jinja */ true);
     lane.chat_msgs.push_back(new_msg);
     LOGi("%s: Formatted and added %s message: \n%s\n", __func__, role.c_str(), formatted.c_str());
     return formatted;
@@ -461,6 +502,7 @@ static size_t common_prefix_length(const llama_tokens &a, const llama_tokens &b)
 }
 
 static int decode_tokens_in_batches(
+        Slot &slot,
         Lane &lane,
         llama_context *context,
         llama_batch &batch,
@@ -477,7 +519,7 @@ static int decode_tokens_in_batches(
         // Shift context if current batch cannot fit into the context
         if (start_pos + i + cur_batch_size >= LANE_CONTEXT_SIZE - OVERFLOW_HEADROOM) {
             LOGw("%s: Current batch won't fit into lane %d! Shifting...", __func__, lane.id);
-            shift_context(lane);
+            shift_context(slot, lane);
         }
 
         // Add tokens to the batch with proper positions
@@ -512,13 +554,15 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         JNIEnv *env,
         jobject /*unused*/,
         jstring jsystem_prompt,
-        jint jlane
+        jint jlane,
+        jint jslot
 ) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
-    Lane &lane = lane_at(jlane);
+    Slot &slot = slot_at(jslot);
+    Lane &lane = lane_at(slot, jlane);
     // Reset the chat-template bookkeeping and the per-turn state, but leave the
     // KV cache resident: the prefill below reuses whatever prefix still matches.
-    reset_long_term_states(lane, /* clear_kv_cache */ false);
+    reset_long_term_states(slot, lane, /* clear_kv_cache */ false);
     reset_short_term_states(lane);
 
     // Obtain system prompt from JEnv
@@ -527,17 +571,17 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
     std::string formatted_system_prompt(system_prompt);
 
     // Format system prompt if applicable
-    const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
+    const bool has_chat_template = common_chat_templates_was_explicit(slot.chat_templates.get());
     if (has_chat_template) {
-        formatted_system_prompt = chat_add_and_format(lane, ROLE_SYSTEM, system_prompt);
+        formatted_system_prompt = chat_add_and_format(slot, lane, ROLE_SYSTEM, system_prompt);
     }
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
 
     // Tokenize system prompt
-    auto system_tokens = common_tokenize(g_context, formatted_system_prompt,
+    auto system_tokens = common_tokenize(slot.context, formatted_system_prompt,
                                          false, true);
     for (auto id: system_tokens) {
-        LOGv("token: `%s`\t -> `%d`", common_token_to_piece(g_context, id).c_str(), id);
+        LOGv("token: `%s`\t -> `%d`", common_token_to_piece(slot.context, id).c_str(), id);
     }
 
     // Handle context overflow
@@ -568,17 +612,17 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
     // the close have to be decoded. A different conversation shares no prefix and
     // falls back to a full prefill on its own.
     const int n_reused = (int) common_prefix_length(lane.cached_tokens, system_tokens);
-    llama_memory_seq_rm(llama_get_memory(g_context), lane.id, n_reused, -1);
+    llama_memory_seq_rm(llama_get_memory(slot.context), lane.id, n_reused, -1);
     lane.cached_tokens.resize(n_reused);
     lane.current_position = n_reused;
 
     const llama_tokens pending(system_tokens.begin() + n_reused, system_tokens.end());
-    LOGi("%s: lane %d system prefill: %d tokens reused, %d to decode",
-         __func__, lane.id, n_reused, (int) pending.size());
+    LOGi("%s: slot %d lane %d system prefill: %d tokens reused, %d to decode",
+         __func__, slot.id, lane.id, n_reused, (int) pending.size());
 
     // Decode whatever diverged, in batches
     if (!pending.empty() &&
-        decode_tokens_in_batches(lane, g_context, g_batch, pending, lane.current_position)) {
+        decode_tokens_in_batches(slot, lane, slot.context, slot.batch, pending, lane.current_position)) {
         LOGe("%s: llama_decode() failed!", __func__);
         return 2;
     }
@@ -595,10 +639,12 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
         jobject /*unused*/,
         jstring juser_prompt,
         jint n_predict,
-        jint jlane
+        jint jlane,
+        jint jslot
 ) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
-    Lane &lane = lane_at(jlane);
+    Slot &slot = slot_at(jslot);
+    Lane &lane = lane_at(slot, jlane);
     // Reset short-term states
     reset_short_term_states(lane);
 
@@ -608,16 +654,16 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     std::string formatted_user_prompt(user_prompt);
 
     // Format user prompt if applicable
-    const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
+    const bool has_chat_template = common_chat_templates_was_explicit(slot.chat_templates.get());
     if (has_chat_template) {
-        formatted_user_prompt = chat_add_and_format(lane, ROLE_USER, user_prompt);
+        formatted_user_prompt = chat_add_and_format(slot, lane, ROLE_USER, user_prompt);
     }
     env->ReleaseStringUTFChars(juser_prompt, user_prompt);
 
     // Decode formatted user prompts
-    auto user_tokens = common_tokenize(g_context, formatted_user_prompt, false, true);
+    auto user_tokens = common_tokenize(slot.context, formatted_user_prompt, false, true);
     for (auto id: user_tokens) {
-        LOGv("token: `%s`\t -> `%d`", common_token_to_piece(g_context, id).c_str(), id);
+        LOGv("token: `%s`\t -> `%d`", common_token_to_piece(slot.context, id).c_str(), id);
     }
 
     // Ensure user prompt doesn't exceed the context size by truncating if necessary.
@@ -630,7 +676,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     }
 
     // Decode user tokens in batches
-    if (decode_tokens_in_batches(lane, g_context, g_batch, user_tokens, lane.current_position, true)) {
+    if (decode_tokens_in_batches(slot, lane, slot.context, slot.batch, user_tokens, lane.current_position, true)) {
         LOGe("%s: llama_decode() failed!", __func__);
         return 2;
     }
@@ -681,14 +727,16 @@ JNIEXPORT jstring JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
         JNIEnv *env,
         jobject /*unused*/,
-        jint jlane
+        jint jlane,
+        jint jslot
 ) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
-    Lane &lane = lane_at(jlane);
+    Slot &slot = slot_at(jslot);
+    Lane &lane = lane_at(slot, jlane);
     // Infinite text generation via context shifting
     if (lane.current_position >= LANE_CONTEXT_SIZE - OVERFLOW_HEADROOM) {
         LOGw("%s: Lane %d full! Shifting...", __func__, lane.id);
-        shift_context(lane);
+        shift_context(slot, lane);
     }
 
     // Stop if reaching the marked position
@@ -698,13 +746,13 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
     }
 
     // Sample next token
-    const auto new_token_id = common_sampler_sample(lane.sampler, g_context, -1);
+    const auto new_token_id = common_sampler_sample(lane.sampler, slot.context, -1);
     common_sampler_accept(lane.sampler, new_token_id, true);
 
     // Populate the batch with new token, then decode
-    common_batch_clear(g_batch);
-    common_batch_add(g_batch, new_token_id, lane.current_position, {lane.id}, true);
-    if (llama_decode(g_context, g_batch) != 0) {
+    common_batch_clear(slot.batch);
+    common_batch_add(slot.batch, new_token_id, lane.current_position, {lane.id}, true);
+    if (llama_decode(slot.context, slot.batch) != 0) {
         LOGe("%s: llama_decode() failed for generated token", __func__);
         return nullptr;
     }
@@ -714,14 +762,14 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
     lane.current_position++;
 
     // Stop if next token is EOG
-    if (llama_vocab_is_eog(llama_model_get_vocab(g_model), new_token_id)) {
+    if (llama_vocab_is_eog(llama_model_get_vocab(slot.model), new_token_id)) {
         LOGd("id: %d,\tIS EOG!\nSTOP.", new_token_id);
-        chat_add_and_format(lane, ROLE_ASSISTANT, lane.assistant_ss.str());
+        chat_add_and_format(slot, lane, ROLE_ASSISTANT, lane.assistant_ss.str());
         return nullptr;
     }
 
     // If not EOG, convert to text
-    auto new_token_chars = common_token_to_piece(g_context, new_token_id);
+    auto new_token_chars = common_token_to_piece(slot.context, new_token_id);
     lane.cached_token_chars += new_token_chars;
 
     // Create and return a valid UTF-8 Java string
@@ -742,25 +790,36 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
 
 extern "C"
 JNIEXPORT void JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, jobject /*unused*/) {
+Java_com_arm_aichat_internal_InferenceEngineImpl_unload(JNIEnv * /*unused*/, jobject /*unused*/, jint jslot) {
     std::lock_guard<std::mutex> lock(g_state_mutex);
+    Slot &slot = slot_at(jslot);
+    // Nothing loaded here. Unloading a slot twice, or one that never loaded, has
+    // to be harmless: reset_long_term_states would dereference a null context.
+    if (!slot.model && !slot.context) { return; }
+
     // Reset long-term & short-term states
     for (int i = 0; i < N_LANES; i++) {
-        reset_long_term_states(g_lanes[i]);
-        reset_short_term_states(g_lanes[i]);
+        if (slot.context) reset_long_term_states(slot, slot.lanes[i]);
+        reset_short_term_states(slot.lanes[i]);
     }
 
     // Free up resources
-    for (auto &lane : g_lanes) {
+    for (auto &lane : slot.lanes) {
         if (lane.sampler) {
             common_sampler_free(lane.sampler);
             lane.sampler = nullptr;
         }
     }
-    g_chat_templates.reset();
-    llama_batch_free(g_batch);
-    llama_free(g_context);
-    llama_model_free(g_model);
+    slot.chat_templates.reset();
+    if (slot.batch_ready) {
+        llama_batch_free(slot.batch);
+        slot.batch_ready = false;
+    }
+    llama_free(slot.context);
+    llama_model_free(slot.model);
+    // Leave the slot reusable rather than holding freed pointers.
+    slot.context = nullptr;
+    slot.model = nullptr;
 }
 
 extern "C"
