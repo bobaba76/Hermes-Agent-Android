@@ -58,12 +58,6 @@ Contributions are welcome in any of those; see [CONTRIBUTING.md](CONTRIBUTING.md
 | **Voice** | `SpeechRecognizer` input + `TextToSpeech` output, hands-free Talk mode (on-device recogniser, voice-activated barge-in). In the chat composer the microphone runs a hands-free session on tap — listen, answer aloud, listen again — and plain dictation on long-press. |
 | **UI** | Jetpack Compose + Material 3, OLED-monochrome theme, two-row chat composer with an in-line reasoning-effort control, auto-generated conversation titles, five-group Settings, onboarding, full accessibility strings, es/fr/de/ja/zh-CN localization. |
 
-## Removed / not present
-
-- **Wake word** was removed entirely in v0.11.x — the on-device KWS engine and its
-  foreground service are gone. Hands-free use is the manually-opened Talk mode.
-- **Samsung Knox** integration was a stub and has been deleted.
-
 ---
 
 ## Quick start
