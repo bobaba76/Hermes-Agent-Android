@@ -41,6 +41,16 @@ The prefill and load log lines now name the slot, without which a tool-caller
 prefill reads exactly like a chat one. `docs/LOCAL-INFERENCE-PERF.md` §6 has the
 detail and the invariants.
 
+**Also in this release: `agent-core.ref` repinned to `0e88413`.** The pin is
+load-bearing — CI and `release.yml` check agent-core out at that commit, while a
+local build maps `:core:*` straight onto the working tree and never sees a
+mismatch. It had not been bumped for the v1.0.2 engine work, so CI had been
+failing since that release on `ChatRepositoryImpl.kt:206 — No value passed for
+parameter 'anchorId'`: this app's new code compiled against an old engine that
+still required the parameter. Both apps' CI is green again as of this release.
+The rule it leaves behind is that a JNI or shared-API change in agent-core and
+the app-side change that uses it must be repinned together.
+
 ## v1.0.2 (2026-09-07) — on-device prefill stops being re-done every turn
 
 A local turn was dominated by prefill that should not have been happening.
