@@ -16,9 +16,28 @@ explicit approval model, and keeps every secret in the Android Keystore.
 > Signed release APKs are attached to each
 > [GitHub release](https://github.com/l3ad3r1/Hermes-Agent-Android/releases).
 
-Hermes shares its engine with the private **Jeeves** super-app through the
+Hermes shares its engine with the **Jeeves** super-app through the
 [`agent-core`](https://github.com/l3ad3r1/agent-core) multi-module library
 (pinned per build in `agent-core.ref`).
+
+---
+
+## Direction
+
+Hermes is a privacy-first agent that should stay useful with no cloud provider
+configured at all. Current priorities, in order:
+
+1. **On-device inference that is actually pleasant to use.** The last two
+   releases were almost entirely this — KV prefix reuse, a separate KV lane for
+   background work, and one model slot per role so a tool call stops evicting the
+   chat model. Prefill on a long thread is roughly 9x faster than it was.
+2. **Retrieval that survives a restart.** Real MiniLM embeddings are wired; the
+   vector index is still in-memory and the model is not downloaded for you
+   (see [docs/BUGS.md](docs/BUGS.md)).
+3. **A desktop companion** on the same engine — the reason `agent-core` is kept
+   free of Android-specific code ([issue #7](https://github.com/l3ad3r1/Hermes-Agent-Android/issues/7)).
+
+Contributions are welcome in any of those; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -30,7 +49,7 @@ Hermes shares its engine with the private **Jeeves** super-app through the
 | **On-device inference** | Llama 3.2 1B (or any user-supplied `.gguf`) runs through a pinned `llama.cpp` submodule (arm64-v8a, CMake/NDK). Each turn reuses the longest token prefix already in the KV cache rather than re-prefilling the system block, and background work (the conversation brief) runs on a second KV lane so it cannot evict the conversation's cached prefix. Unloads under memory pressure or after an idle timeout. |
 | **Multi-agent orchestration** | `AgentRouter` → `OrchestratorImpl` builds a plan across five roles (Conversational, Productivity, Research, Device control, Creative) and runs a per-step tool-call loop with shared cross-agent context. Deterministic phone commands bypass the LLM entirely. |
 | **Tools (~50)** | Calendar, alarms, communication, media, navigation, device settings, camera, Home Assistant, web search/fetch, file read/write/patch, shell + Termux (behind biometrics), accessibility-driven screen automation, Kanban, memory, skills, delegation, and more. Two gates: per-role grants (`AgentToolAccess`) and a runtime execution policy (allow / confirm / deny by origin). |
-| **Memory & RAG** | Short-term sliding window plus a long-term semantic store (hybrid vector + BM25). A daily WorkManager pass consolidates facts while charging. Documents are chunked and indexed for retrieval. |
+| **Memory & RAG** | Short-term sliding window plus a long-term semantic store (hybrid vector + BM25). A daily WorkManager pass consolidates facts while charging. Documents are chunked and indexed for retrieval. Embeddings come from on-device all-MiniLM-L6-v2 via ONNX Runtime **when the model files are present on shared storage** — nothing downloads them yet, and without them it falls back to hash vectors. The index is in-memory and rebuilds on restart. |
 | **Plugins** | In-app JavaScript plugins (`ScriptPluginEngine`) stored in Room, plus first-party native plugins (Weather, FileManager, Contacts). Community plugins install from a signed, SHA-256-pinned HTTPS registry. |
 | **Messaging gateways** | Telegram, Discord, Signal and WhatsApp bridges with an LLM-callable `notify` tool; webhook in/out. |
 | **Proactivity** | Background heartbeat runs standing orders on a schedule (skips under Battery Saver / low battery), ambient presence beacon resolves your own labelled places without Play Services and discards the coordinate, digest + nudges with quiet hours and a ping budget. |

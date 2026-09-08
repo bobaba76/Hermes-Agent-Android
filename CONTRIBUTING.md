@@ -1,9 +1,13 @@
 # Contributing to Hermes Agent
 
-Thanks for your interest in contributing. The goal is to grow Hermes Agent from a solid Android foundation into a fully-capable, cross-platform AI agent and work in tandem with the hermes Agent desktop app. All skill levels welcome; the issue tracker is broken into bite-sized bugs and larger features.
+Thanks for your interest. Hermes is a privacy-first Android AI agent that aims to
+stay useful with no cloud provider configured at all, and to grow onto the desktop
+without rewriting the agent. All skill levels welcome — the issue tracker ranges
+from self-contained bugs to multi-week features.
 
 ## Table of contents
-- [Quick start](#quick-start)
+- [Setting up](#setting-up)
+- [The two-repo layout](#the-two-repo-layout)
 - [How to contribute](#how-to-contribute)
 - [Issue labels](#issue-labels)
 - [PR guidelines](#pr-guidelines)
@@ -13,41 +17,70 @@ Thanks for your interest in contributing. The goal is to grow Hermes Agent from 
 
 ---
 
-## Quick start
+## Setting up
+
+**Requirements:** JDK 21 (JetBrains Runtime), a recent Android Studio, Android SDK
+with **NDK 28.2** and CMake (the `llama.cpp` bridge is built from source),
+`minSdk 29` / `targetSdk 36`.
 
 ```bash
-# Requirements: Android Studio Hedgehog (2023.1.1) or newer, JDK 17
+# The engine is a separate repo and is NOT vendored — clone both, side by side.
+git clone https://github.com/l3ad3r1/agent-core.git
 git clone https://github.com/l3ad3r1/Hermes-Agent-Android.git
-cd "Hermes-Agent-Android/hermes agent android"
 
-# Build debug APK (no API key needed — on-device mock responds to all prompts)
-./gradlew assembleDebug
-
-# Run unit tests
-./gradlew test
+cd Hermes-Agent-Android
+git submodule update --init      # pinned llama.cpp
+./gradlew :app:assembleDebug     # ~90 MB debug APK, compiles native libs
+./gradlew :app:installDebug
+./gradlew test                   # unit tests
 ```
 
-**Optional — wire a real LLM endpoint:**  
-Create `hermes.local.properties` at the project root (gitignored):
-```properties
-# Any OpenAI-compatible endpoint — OpenAI, Azure, vLLM, Ollama, NVIDIA NIM
-hermes.cloudApiKey=sk-your-key-here
-hermes.cloudBaseUrl=https://api.openai.com/v1
-hermes.cloudModel=gpt-4o-mini
-```
+If `agent-core` is missing, configuration fails with an explicit error telling you
+to clone it — that is expected, not a broken build.
 
-See [docs/BUILD.md](docs/BUILD.md) for IDE setup and endpoint config.
+**Getting a reply out of it.** The app builds and installs with no API key, but
+there is no built-in mock: you need either a cloud provider (**Settings →
+Assistant → Providers** — OpenAI, OpenRouter, Nous, Gemini, Groq, DeepSeek, or any
+OpenAI-compatible `/v1` endpoint) or an on-device model downloaded from the in-app
+catalogue. Keys are entered in-app and encrypted; nothing is baked into the build.
+
+See [docs/BUILD.md](docs/BUILD.md) for the release toolchain and endpoint swaps.
+
+---
+
+## The two-repo layout
+
+| Repo | Contents |
+|---|---|
+| **Hermes-Agent-Android** (this one) | Compose UI, app identity, signing, the `llama.cpp` JNI bridge (`app/src/main/cpp/ai_chat.cpp`), app-specific tool bindings. |
+| **[agent-core](https://github.com/l3ad3r1/agent-core)** | The shared engine: domain contracts, model routing, tools, memory, persistence, settings. |
+
+The split exists because two shipping apps run on one engine — Hermes and
+**[Jeeves](https://github.com/l3ad3r1/Jeeves)** — so engine changes land in both
+instead of drifting. It also keeps the engine free of Android-specific code, which
+is what makes the desktop target a port rather than a rewrite.
+
+**The one thing that will catch you.** This app pins the engine commit it builds
+against in `agent-core.ref`, and **CI honours that pin while your local build
+ignores it** (locally, `:core:*` maps straight onto your working tree). If your
+change touches a shared API or JNI signature *and* its caller here, bump
+`agent-core.ref` in the same PR — otherwise it compiles cleanly for you and fails
+in CI on a signature nothing locally disagrees with. This app shipped v1.0.2 with
+red CI for exactly that reason.
+
+`ai_chat.cpp` is **byte-identical** with the copy in Jeeves. Change it in both, in
+the same change; `md5sum` them before opening the PR.
 
 ---
 
 ## How to contribute
 
-1. **Check existing issues first.** Someone may already be working on it.
-2. **For bugs:** open an issue with the `bug` label before sending a PR. Include: steps to reproduce, expected vs actual, Android version, device.
-3. **For features:** open an issue with `enhancement` to discuss the approach before coding. Large features should reference a design sketch or the relevant section of [ARCHITECTURE.md](docs/ARCHITECTURE.md).
-4. **For good-first-issues:** filter by [`good first issue`](https://github.com/l3ad3r1/Hermes-Agent-Android/issues?q=is%3Aissue+label%3A%22good+first+issue%22) — these are self-contained and well-scoped.
-5. **Fork → branch → PR.** Branch names: `fix/<short-description>` or `feat/<short-description>`.
-6. All PRs target `main`.
+1. **Check existing issues first** — someone may already be on it.
+2. **Bugs:** open an issue with `bug` before sending a PR. Include repro steps,
+   expected vs actual, Android version and device.
+3. **Features:** open an `enhancement` issue to agree the approach first. Large
+   ones should reference [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+4. **Fork → branch → PR.** Branches: `fix/<short>` or `feat/<short>`, targeting `main`.
 
 ---
 
@@ -55,29 +88,30 @@ See [docs/BUILD.md](docs/BUILD.md) for IDE setup and endpoint config.
 
 | Label | Meaning |
 |---|---|
-| `bug` | Something broken or not working as documented |
-| `good first issue` | Self-contained, approx 1–2 hours, minimal context needed |
-| `enhancement` | New capability within the existing Android app |
-| `desktop` | Work toward the Hermes Agent Desktop target |
-| `llm-backend` | On-device LLM, embeddings, NPU, MLC-LLM |
-| `plugin` | Plugin framework, sandbox, marketplace |
-| `security` | Certificate pinning, Keystore, Knox, permissions |
-| `ui` | Compose UI, theming, accessibility |
-| `performance` | Memory pressure, startup, battery |
+| `bug` | Broken, or not working as documented |
+| `good first issue` | Self-contained, roughly 1–2 hours, minimal context |
+| `enhancement` | New capability in the existing app |
+| `desktop` | Work toward the desktop target |
+| `llm-backend` | On-device LLM, embeddings, retrieval |
+| `plugin` | Plugin framework, sandbox, registry |
+| `security` | Keystore, pinning, permissions |
+| `ui` | Compose, theming, accessibility |
+| `performance` | Memory pressure, startup, battery, inference speed |
 | `test` | Missing or broken tests |
 | `docs` | Documentation gaps |
-| `help wanted` | Maintainer would especially welcome a PR here |
+| `help wanted` | A PR here would be especially welcome |
 
 ---
 
 ## PR guidelines
 
-- Keep PRs focused. One logical change per PR — easier to review, easier to revert.
-- Every new class needs at least one unit test. See `app/src/test/` for patterns.
-- Run `./gradlew test lintDebug` before pushing. Fix all errors; warnings are advisory.
-- No hardcoded API keys, credentials, or device-specific paths.
-- ProGuard: if you add a new `@Keep` annotation or `-keep` rule, explain why in the PR description.
-- Commit messages: one subject line (≤72 chars) + optional body. Present tense ("Add X", not "Added X").
+- One logical change per PR — easier to review, easier to revert.
+- Every new class needs at least one unit test; see `app/src/test/` for patterns.
+- Run `./gradlew test lintDebug` before pushing. Fix errors; warnings are advisory.
+- No hardcoded API keys, credentials or device-specific paths.
+- ProGuard: if you add a `@Keep` or `-keep` rule, say why in the PR description.
+- Commit subject in the present tense, 72 chars or fewer ("Add X", not "Added X").
+- Say whether an `agent-core.ref` repin is needed.
 
 ---
 
@@ -87,46 +121,58 @@ See [docs/BUILD.md](docs/BUILD.md) for IDE setup and endpoint config.
 UI (Compose) → ViewModel → Domain (interfaces) ← Data (implementations)
 ```
 
-- **`domain/`** — pure Kotlin, no Android imports. Models, repository interfaces, agent contracts.
-- **`data/`** — Room, Retrofit, LlmProvider impls, memory/RAG/plugin/tool implementations.
-- **`ui/`** — Compose screens and ViewModels. ViewModels talk to repositories; screens talk to ViewModels only.
-- **`di/`** — Hilt modules wiring everything together.
+- **`domain/`** (in agent-core) — pure Kotlin, no Android imports. Models,
+  repository interfaces, agent contracts.
+- **`data/`** — Room, Retrofit, `LlmProvider` implementations, memory/RAG, plugins, tools.
+- **`ui/`** — Compose screens and ViewModels. ViewModels talk to repositories;
+  screens talk to ViewModels only.
+- **`di/`** — Hilt modules; tools are multibound here.
 - **`work/`** — WorkManager jobs (memory consolidation).
 
-The LLM is behind a `LlmProvider` interface. Swapping in MLC-LLM for on-device inference only requires implementing that interface — the rest of the stack is unaffected.
+A turn goes `AgentRouter` → `OrchestratorImpl` → a per-step tool-call loop across
+five roles. Deterministic phone commands are parsed locally and never reach a model.
 
-Full details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | [docs/MODULES.md](docs/MODULES.md)
+Full details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) · [docs/MODULES.md](docs/MODULES.md) ·
+[docs/LOCAL-INFERENCE-PERF.md](docs/LOCAL-INFERENCE-PERF.md) for the on-device engine
+and the invariants that keep prefill fast.
 
 ---
 
 ## High-priority areas
 
-These are the biggest gaps between the current state and full capability. Each has a tracking issue.
+### Desktop — Compose Multiplatform ([#7](https://github.com/l3ad3r1/Hermes-Agent-Android/issues/7))
+The long-term goal, and the most impactful place to help. `agent-core` is already
+platform-neutral, so this is largely extracting a shared UI layer and a desktop
+entry point rather than reimplementing the agent.
 
-### Desktop (Hermes Agent Desktop)
-The long-term goal is a desktop companion app sharing the same agent, tool, and plugin logic. Candidates: Compose Multiplatform (share UI), or KMP shared module feeding a native desktop UI. If you have experience with Compose Multiplatform or JVM desktop frameworks, this is the most impactful area to contribute.
+### Ship the embedding model ([#3](https://github.com/l3ad3r1/Hermes-Agent-Android/issues/3))
+`MiniLmEmbeddingService` is real and DI-bound — ONNX Runtime, all-MiniLM-L6-v2
+int8, 384-dim, mean-pooled and L2-normalised. But it reads `model.onnx` and
+`vocab.txt` from `AI Models/embeddings/all-MiniLM-L6-v2` on shared storage and
+silently falls back to `HashingEmbeddingService` when they are absent, and nothing
+downloads them. Wiring the model into the download catalogue would make good
+retrieval the default rather than a lucky accident.
 
-### On-device LLM (MLC-LLM / llama.cpp)
-`OnDeviceLlmProvider` currently returns canned responses. The contract is defined — the JNI bindings and Snapdragon NPU integration need to be wired. See `LlmProvider.kt` and `OnDeviceLlmProvider.kt`.
+### Persistent vector store ([#4](https://github.com/l3ad3r1/Hermes-Agent-Android/issues/4))
+`InMemoryVectorStore` loses every vector on process death and rebuilds by
+re-embedding. sqlite-vec or SQLite-VSS behind the `VectorStore` interface.
 
-### Real embeddings (MiniLM)
-`HashingEmbeddingService` uses SHA-256 as a placeholder. A real MiniLM model (ONNX or TFLite) needs to replace it. The `EmbeddingService` interface is the only seam.
+### LLM-based fact extraction ([#10](https://github.com/l3ad3r1/Hermes-Agent-Android/issues/10))
+Memory consolidation still uses a regex extractor.
 
-### SQLite-VSS persistent vector store
-`InMemoryVectorStore` loses all vectors on restart. SQLite-VSS (or sqlite-vec) as a persistent backend needs to swap in behind the `VectorStore` interface.
+### Certificate pinning ([#5](https://github.com/l3ad3r1/Hermes-Agent-Android/issues/5))
+Not applied today because the endpoint is user-configurable. Opt-in pinning for
+fixed-provider users. Self-contained; a good first security PR.
 
-### gRPC plugin sandbox
-`GrpcPluginSandbox` is an interface stub. Real inter-process gRPC IPC so third-party plugins run in isolated processes is the target.
-
-### Certificate pinning hashes
-`CertificatePinningConfig` ships placeholder SHA-256 pins. Real pins for `api.openai.com` and any other fixed endpoints need to be captured and inserted before public release.
+### gRPC plugin sandbox ([#6](https://github.com/l3ad3r1/Hermes-Agent-Android/issues/6))
+`GrpcPluginSandbox` is an interface stub; real process isolation for third-party
+plugins.
 
 ---
 
 ## Code style
 
-- Kotlin idioms preferred. No `!!` unless you've proven it can't be null at that point.
-- Coroutines over threads. Use `DispatcherProvider` for testability (never `Dispatchers.IO` directly).
-- Hilt for DI — no manual `getInstance()` patterns.
-- Compose: stateless composables + hoisted state. ViewModels own state; screens observe it.
-- No `Log.d/e` — use `Timber.d/e` everywhere.
+Match the surrounding code. Kotlin official style, 4-space indent, explicit
+visibility on public API. Comments should explain *why*, not restate the code —
+the existing codebase leans on that heavily, especially around the inference and
+approval paths where the non-obvious constraint is the whole point.

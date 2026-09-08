@@ -5,7 +5,7 @@ kept separate from the roadmap so regressions are tracked without presenting
 planned work as a bug. The granular register with repro steps and evidence is the
 `Known Issues` sheet of `Hermes-Test-Regimen.xlsx`.
 
-Last reviewed: **2026-09-03 (v0.11.3)**.
+Last reviewed: **2026-09-08 (v1.0.3)**.
 
 ## Open
 
@@ -36,8 +36,15 @@ Last reviewed: **2026-09-03 (v0.11.3)**.
 - Shell and Termux commands always require biometric or device-PIN approval.
 - Certificate pinning is not applied because the cloud endpoint is user-
   configurable; TLS is still enforced ([issue #5]).
-- Retrieval embeddings are SHA-256 hash vectors and the vector index is in-memory
-  ([issues #3] and [#4]).
+- **Embeddings work, but the model is not shipped.** `MiniLmEmbeddingService`
+  (ONNX Runtime, all-MiniLM-L6-v2 int8, 384-dim) is what DI binds, and it reads
+  `model.onnx` and `vocab.txt` from `AI Models/embeddings/all-MiniLM-L6-v2` on
+  shared storage. Nothing in the app downloads them, and when they are absent it
+  falls back to `HashingEmbeddingService` **silently** — so retrieval quality
+  depends on whether those files happen to be on the device, with no indication
+  either way in the UI ([issue #3]).
+- The vector index is in-memory: every vector is lost on process death and
+  rebuilt by re-embedding from Room ([issue #4]).
 - Release CI cannot sign until `RELEASE_KEYSTORE_BASE64`,
   `RELEASE_KEYSTORE_PASSWORD`, `RELEASE_KEY_ALIAS` and `RELEASE_KEY_PASSWORD` are
   set as repo secrets. Until then, releases are built and published by hand from
