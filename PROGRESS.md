@@ -1,5 +1,13 @@
 # Hermes Agent — Progress
 
+## 2026-09-09 — Material 3 skill installed
+
+Installed the public `hamen/material-3-skill` into `C:\Users\renja\.codex\skills\material-3`.
+It is now available for Compose Material 3 implementation and UI compliance audits.
+
+Next step: invoke the skill when reviewing or changing Hermes/Jeeves Compose UI; no app
+source was changed in this step.
+
 ## v1.0.3 (2026-09-08) — a tool call no longer evicts the chat model
 
 v1.0.2 stopped the chat cache being thrown away every turn. One thing could
