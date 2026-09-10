@@ -13,11 +13,10 @@ fingerprint, shell execution has a real deadline, deferred tool grants are
 per-coroutine, RAG and saved-memory vectors are partitioned, and plugin/MCP/native
 engine checks fail safely.
 
-**VERIFIED:** focused shared plugin repository regression test passed.
+**VERIFIED:** focused shared plugin repository regression test and `:app:compileDebugKotlin` passed.
 
 **UNVERIFIED:** device execution of share/notification, API-key rotation, Android
-foreground-service timeout, and SSH host-fingerprint flows; full app build was
-started but exceeded this session's command window.
+foreground-service timeout, and SSH host-fingerprint flows.
 
 ## 2026-09-09 — Material 3 skill installed
 
