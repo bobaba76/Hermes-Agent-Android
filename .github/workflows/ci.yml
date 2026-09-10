@@ -25,6 +25,11 @@ jobs:
       # exist" — which is exactly how every run between the engine split and
       # 2026-08-30 failed. agent-core.ref pins the engine commit so a green
       # run names the engine it was green against.
+      #
+      # NOTE: the engine is currently fetched from the bobaba76/agent-core
+      # fork (agent-core.ref pins that fork's tip) while the
+      # feature/remote-gateway-settings change is pending upstream. Switch
+      # the repository back to l3ad3r1/agent-core once it is merged there.
       - name: Resolve pinned agent-core ref
         id: engine
         run: |
@@ -39,7 +44,7 @@ jobs:
       - name: Check out the agent-core engine
         uses: actions/checkout@v4
         with:
-          repository: l3ad3r1/agent-core
+          repository: bobaba76/agent-core
           ref: ${{ steps.engine.outputs.ref }}
           path: agent-core
 
