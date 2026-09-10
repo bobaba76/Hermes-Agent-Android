@@ -110,7 +110,19 @@ class RemoteOrchestrator @Inject constructor(
                     }
 
                     is GatewayEvent.ApprovalRequested -> {
-                        handleApproval(runId, event, stepId)
+                        // Surface the phone-side approval dialog via the existing
+                        // ToolConfirmationService — the same mechanism
+                        // OrchestratorImpl uses. The service suspends on a
+                        // CompletableDeferred; the UI observes pendingRequest
+                        // and calls submitConfirmation() when the user taps.
+                        val call = parseToolCall(event.callId, event.toolName, event.arguments)
+                        emit(OrchestratorEvent.ToolCallRequested(call, requiresConfirmation = true))
+                        val approved = toolConfirmationService.awaitConfirmation(call)
+                        Timber.tag("RemoteOrchestrator").i(
+                            "Approval call=%s approved=%s — forwarding to PC",
+                            event.toolName, approved,
+                        )
+                        gatewayClient.submitApproval(runId, approved)
                     }
 
                     is GatewayEvent.RunCompleted -> {
@@ -153,34 +165,6 @@ class RemoteOrchestrator @Inject constructor(
             emit(OrchestratorEvent.Failed(e.message ?: "Remote gateway error"))
         }
     }.flowOn(dispatchers.io)
-
-    /**
-     * Surface the phone-side approval dialog, wait for the user's decision,
-     * and forward it to the PC gateway.
-     *
-     * This reuses [ToolConfirmationService] — the exact same mechanism
-     * [OrchestratorImpl] uses. The service suspends on a
-     * `CompletableDeferred`; the UI observes `pendingRequest: StateFlow` and
-     * calls `submitConfirmation(requestId, approved)` when the user taps.
-     * Once the boolean returns, we POST it back to the PC.
-     */
-    private suspend fun handleApproval(
-        runId: String,
-        event: GatewayEvent.ApprovalRequested,
-        stepId: String,
-    ) {
-        val call = parseToolCall(event.callId, event.toolName, event.arguments)
-        // Emit the tool-call request with requiresConfirmation=true so the
-        // UI shows the approval dialog.
-        emit(OrchestratorEvent.ToolCallRequested(call, requiresConfirmation = true))
-        // Block until the user responds via the existing UI flow.
-        val approved = toolConfirmationService.awaitConfirmation(call)
-        Timber.tag("RemoteOrchestrator").i(
-            "Approval call=%s approved=%s — forwarding to PC",
-            event.toolName, approved,
-        )
-        gatewayClient.submitApproval(runId, approved)
-    }
 
     /**
      * Parse a tool call from the gateway's event payload.

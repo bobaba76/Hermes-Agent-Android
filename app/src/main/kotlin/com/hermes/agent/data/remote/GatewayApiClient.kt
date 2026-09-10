@@ -3,6 +3,7 @@ package com.hermes.agent.data.remote
 import com.hermes.agent.domain.settings.SettingsRepository
 import com.hermes.agent.util.DispatcherProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
@@ -23,6 +24,7 @@ import java.io.BufferedReader
 import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.coroutines.coroutineContext
 
 /**
  * HTTP + SSE client for the PC Hermes gateway's REST API.
@@ -124,7 +126,7 @@ class GatewayApiClient @Inject constructor(
         try {
             var eventType = ""
             val dataBuilder = StringBuilder()
-            while (coroutineContext[kotlinx.coroutines.Job]?.isActive != false) {
+            while (coroutineContext[Job]?.isActive != false) {
                 val line = reader.readLine() ?: break
                 when {
                     line.startsWith("event:") -> eventType = line.removePrefix("event:").trim()
@@ -140,7 +142,7 @@ class GatewayApiClient @Inject constructor(
                 }
             }
         } catch (e: IOException) {
-            if (coroutineContext[kotlinx.coroutines.Job]?.isActive != false) {
+            if (coroutineContext[Job]?.isActive != false) {
                 Timber.tag("GatewayClient").w(e, "SSE stream interrupted")
             }
         } finally {
