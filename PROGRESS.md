@@ -1,5 +1,24 @@
 # Hermes Agent — Progress
 
+## 2026-09-10 — Audit remediation
+
+External share and notification text now prefill the composer instead of invoking
+an agent turn. The local API service creates a bearer token before enabling,
+rejects blank-key startup, rotates a live server safely, and stops when Android
+reports a foreground-service time limit. Scheduled work now uses the background
+orchestrator policy.
+
+The shared engine pin is now `849f55d`: SSH requires a verified host-key
+fingerprint, shell execution has a real deadline, deferred tool grants are
+per-coroutine, RAG and saved-memory vectors are partitioned, and plugin/MCP/native
+engine checks fail safely.
+
+**VERIFIED:** focused shared plugin repository regression test passed.
+
+**UNVERIFIED:** device execution of share/notification, API-key rotation, Android
+foreground-service timeout, and SSH host-fingerprint flows; full app build was
+started but exceeded this session's command window.
+
 ## 2026-09-09 — Material 3 skill installed
 
 Installed the public `hamen/material-3-skill` into `C:\Users\renja\.codex\skills\material-3`.

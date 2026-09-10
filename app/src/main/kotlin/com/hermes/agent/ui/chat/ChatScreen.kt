@@ -107,7 +107,7 @@ fun ChatScreen(
     // MainActivity.handleIntent() / PendingChatIntent.
     LaunchedEffect(conversationId) {
         when (val action = PendingChatIntent.pending.value) {
-            is PendingChatIntent.Action.SendText -> viewModel.sendMessage(action.text)
+            is PendingChatIntent.Action.PrefillText -> viewModel.prefillMessage(action.text)
             is PendingChatIntent.Action.ArmVoiceListen -> viewModel.toggleVoiceInput()
             null -> {}
         }

@@ -81,11 +81,16 @@ fun ConnectionsSettingsScreen(
             ApiServerSection(
                 settings = settings,
                 onToggle = { enabled ->
-                    viewModel.setApiServerEnabled(enabled)
-                    if (enabled) ApiServerController.start(context) else ApiServerController.stop(context)
+                    viewModel.setApiServerEnabled(enabled) {
+                        if (enabled) ApiServerController.start(context) else ApiServerController.stop(context)
+                    }
                 },
                 onAllowLan = viewModel::setApiServerAllowLan,
-                onRegenerateKey = viewModel::regenerateApiServerKey,
+                onRegenerateKey = {
+                    viewModel.regenerateApiServerKey {
+                        if (ApiServerController.status.value.running) ApiServerController.restart(context)
+                    }
+                },
             )
 
             SectionHeader(text = "Remote shell")
@@ -95,6 +100,7 @@ fun ConnectionsSettingsScreen(
                 onPort = viewModel::setSshPort,
                 onUser = viewModel::setSshUser,
                 onPassword = viewModel::setSshPassword,
+                onHostFingerprint = viewModel::setSshHostFingerprint,
             )
 
             SectionHeader(text = "Home Assistant")
@@ -228,6 +234,7 @@ private fun RemoteShellSection(
     onPort: (Int) -> Unit,
     onUser: (String) -> Unit,
     onPassword: (String) -> Unit,
+    onHostFingerprint: (String) -> Unit,
 ) {
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -279,8 +286,22 @@ private fun RemoteShellSection(
                 value = password,
                 onValueChange = { password = it; onPassword(it) },
                 label = { Text("Password") },
-                supportingText = { Text("Stored on-device. Host-key checking is disabled (trusted networks only).") },
+                supportingText = { Text("Stored encrypted on-device. Authentication also requires the host fingerprint below.") },
                 visualTransformation = PasswordVisualTransformation(),
+                singleLine = true,
+                colors = hermesFieldColors(),
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            var hostFingerprint by remember(settings.sshHostFingerprint) {
+                mutableStateOf(settings.sshHostFingerprint)
+            }
+            OutlinedTextField(
+                value = hostFingerprint,
+                onValueChange = { hostFingerprint = it; onHostFingerprint(it) },
+                label = { Text("Host key fingerprint") },
+                placeholder = { Text("SHA256:… or aa:bb:…") },
+                supportingText = { Text("Verify this fingerprint out of band before saving it.") },
                 singleLine = true,
                 colors = hermesFieldColors(),
                 modifier = Modifier.fillMaxWidth(),

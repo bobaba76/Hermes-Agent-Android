@@ -16,8 +16,11 @@ import kotlinx.coroutines.flow.StateFlow
 object PendingChatIntent {
 
     sealed class Action {
-        /** Send this text as the user's first message in the new chat. */
-        data class SendText(val text: String) : Action()
+        /**
+         * Put externally supplied text in the composer. Sending remains a
+         * deliberate user action, because MainActivity is exported.
+         */
+        data class PrefillText(val text: String) : Action()
 
         /** Arm voice listening as soon as the chat screen opens. */
         object ArmVoiceListen : Action()

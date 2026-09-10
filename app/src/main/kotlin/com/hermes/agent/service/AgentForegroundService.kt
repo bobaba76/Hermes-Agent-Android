@@ -190,6 +190,11 @@ class AgentForegroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Timber.w("foreground-service time limit reached; stopping the agent service")
+        stopAgent()
+    }
+
     override fun onDestroy() {
         AgentServiceController.setRunning(false)
         scope.cancel()

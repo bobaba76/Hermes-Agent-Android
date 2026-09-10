@@ -52,6 +52,7 @@ class ApiServerService : Service() {
         const val NOTIFICATION_ID = 2002
         const val ACTION_START = "com.hermes.agent.action.START_API_SERVER"
         const val ACTION_STOP = "com.hermes.agent.action.STOP_API_SERVER"
+        const val ACTION_RESTART = "com.hermes.agent.action.RESTART_API_SERVER"
     }
 
     override fun onCreate() {
@@ -62,6 +63,7 @@ class ApiServerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> { stopServer(); return START_NOT_STICKY }
+            ACTION_RESTART -> { stopServer(stopService = false); startServer() }
             else -> startServer()
         }
         return START_STICKY
@@ -79,6 +81,11 @@ class ApiServerService : Service() {
 
         scope.launch(Dispatchers.IO) {
             val settings = settingsRepository.current()
+            if (settings.apiServerKey.isBlank()) {
+                ApiServerController.setError("API server needs a bearer token before it can start.")
+                stopServer()
+                return@launch
+            }
             val host = if (settings.apiServerAllowLan) "0.0.0.0" else "127.0.0.1"
             val port = settings.apiServerPort
             val displayHost = if (settings.apiServerAllowLan) (lanIpv4() ?: "0.0.0.0") else "127.0.0.1"
@@ -99,25 +106,31 @@ class ApiServerService : Service() {
             try {
                 // NanoHTTPD.start with SOCKET_READ_TIMEOUT and daemon=false so the
                 // listener thread keeps the server alive alongside the service.
-                srv.start(NanoTimeouts.SOCKET_READ_TIMEOUT, false)
                 server = srv
+                srv.start(NanoTimeouts.SOCKET_READ_TIMEOUT, false)
                 ApiServerController.setRunning(displayHost, port)
                 Timber.tag("ApiServer").i("started on %s:%d (lan=%b)", host, port, settings.apiServerAllowLan)
             } catch (t: Throwable) {
                 Timber.tag("ApiServer").e(t, "failed to start on port %d", port)
                 ApiServerController.setError(t.message ?: "failed to start (port $port in use?)")
+                server = null
                 runCatching { srv.stop() }
                 stopSelf()
             }
         }
     }
 
-    private fun stopServer() {
+    private fun stopServer(stopService: Boolean = true) {
         server?.let { runCatching { it.stop() } }
         server = null
         ApiServerController.setStopped()
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        if (stopService) stopSelf()
+    }
+
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        Timber.tag("ApiServer").w("foreground-service time limit reached; stopping API server")
+        stopServer()
     }
 
     /** First non-loopback IPv4 address, for showing a reachable LAN URL. */

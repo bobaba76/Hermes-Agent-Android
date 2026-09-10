@@ -761,14 +761,16 @@ class SettingsViewModel @Inject constructor(
 
     // --- Local API server ---
 
-    /** Persist the enabled flag; auto-generate a bearer key on first enable
-     *  so the server is never unintentionally open. Returns nothing — the
-     *  caller starts/stops [com.hermes.agent.service.ApiServerService]. */
-    fun setApiServerEnabled(enabled: Boolean) = viewModelScope.launch {
+    /**
+     * Persist the setting and its initial bearer key before the caller binds
+     * the server. A listening server must never observe a blank-key snapshot.
+     */
+    fun setApiServerEnabled(enabled: Boolean, onPersisted: () -> Unit = {}) = viewModelScope.launch {
         if (enabled && settings.value.apiServerKey.isBlank()) {
             settingsRepository.setApiServerKey(generateApiKey())
         }
         settingsRepository.setApiServerEnabled(enabled)
+        onPersisted()
     }
 
     fun setApiServerPort(port: Int) = viewModelScope.launch {
@@ -779,8 +781,9 @@ class SettingsViewModel @Inject constructor(
         settingsRepository.setApiServerAllowLan(allow)
     }
 
-    fun regenerateApiServerKey() = viewModelScope.launch {
+    fun regenerateApiServerKey(onPersisted: () -> Unit = {}) = viewModelScope.launch {
         settingsRepository.setApiServerKey(generateApiKey())
+        onPersisted()
     }
 
     // --- Remote shell (SSH) ---
@@ -789,6 +792,9 @@ class SettingsViewModel @Inject constructor(
     fun setSshPort(port: Int) = viewModelScope.launch { settingsRepository.setSshPort(port) }
     fun setSshUser(user: String) = viewModelScope.launch { settingsRepository.setSshUser(user) }
     fun setSshPassword(password: String) = viewModelScope.launch { settingsRepository.setSshPassword(password) }
+    fun setSshHostFingerprint(fingerprint: String) = viewModelScope.launch {
+        settingsRepository.setSshHostFingerprint(fingerprint)
+    }
 
     fun setHomeAssistantUrl(url: String) = viewModelScope.launch {
         settingsRepository.setHomeAssistantUrl(url)

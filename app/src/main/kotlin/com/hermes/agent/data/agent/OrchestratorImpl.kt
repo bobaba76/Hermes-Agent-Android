@@ -277,11 +277,10 @@ class OrchestratorImpl @Inject constructor(
                 contextWindowTokens = ASSUMED_CONTEXT_TOKENS,
             )
             val tools = disclosure.modelVisibleDescriptors
-            // Publish what the bridge may reach this step. This set is already
-            // grant-filtered (it came from agent.availableTools above), and the
-            // bridge tools read nothing else - without it tool_search/tool_call
-            // would serve the whole registry regardless of role.
-            deferredToolScope.publish(disclosure.deferredDescriptors.map { it.name }.toSet())
+            // The bridge may only reach names this step already has grants for.
+            // Its scope is installed around the tool loop below so concurrent
+            // orchestrations cannot replace one another's grants.
+            val deferredToolNames = disclosure.deferredDescriptors.map { it.name }.toSet()
 
             // Pin a single text tool-call format so models that don't use
             // structured tool_calls (Gemma's ```tool_code```, Nemotron's
@@ -367,7 +366,8 @@ class OrchestratorImpl @Inject constructor(
             }
             AgentActivity.setPhase(AgentPhase.THINKING)
             val loopOutcome = try {
-                agentLoopRunner.run(
+                deferredToolScope.withScope(deferredToolNames) {
+                    agentLoopRunner.run(
                     provider = provider,
                     initialMessages = llmMessages,
                     tools = tools,
@@ -404,7 +404,8 @@ class OrchestratorImpl @Inject constructor(
                         // another tool or starts replying.
                         AgentActivity.setPhase(AgentPhase.THINKING)
                     },
-                )
+                    )
+                }
             } catch (cancelled: CancellationException) {
                 withContext(NonCancellable) {
                     executionPlanRepository.markStepFinished(
@@ -445,11 +446,6 @@ class OrchestratorImpl @Inject constructor(
             executionPlanRepository.markStepFinished(step.id, StepStatus.SUCCEEDED)
             emit(OrchestratorEvent.StepFinished(step.id, success = true))
         }
-
-        // Every step publishes its own scope before use, so this only guards the
-        // gap after the last one: a stale scope must not outlive the turn that
-        // earned it. Fails closed - an empty scope lets the bridge reach nothing.
-        deferredToolScope.clear()
 
         val finalText = aggregator.toString()
         emit(

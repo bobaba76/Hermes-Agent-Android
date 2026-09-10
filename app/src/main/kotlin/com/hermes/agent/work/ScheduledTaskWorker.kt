@@ -5,15 +5,14 @@ import androidx.hilt.work.HiltWorker
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.hermes.agent.data.proactive.ProactiveNotifier
-import com.hermes.agent.domain.model.ChatStreamEvent
+import com.hermes.agent.domain.agent.ExecutionOrigin
+import com.hermes.agent.domain.agent.OrchestratorEvent
 import com.hermes.agent.domain.proactive.ProactiveSource
 import com.hermes.agent.domain.repository.ChatRepository
 import com.hermes.agent.domain.repository.CronRepository
 import com.hermes.agent.domain.repository.ConversationRepository
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
-import kotlinx.coroutines.flow.firstOrNull
-import kotlinx.coroutines.flow.toList
 import timber.log.Timber
 
 /**
@@ -61,15 +60,20 @@ class ScheduledTaskWorker @AssistedInject constructor(
             // Create a throw-away conversation for this run.
             val convId = conversationRepository.createConversation(label)
 
-            // Collect the streamed reply; Complete carries the final
-            // persisted message, tokens are the fallback if it never arrives.
+            // Scheduled work uses the same orchestrator as an interactive turn,
+            // but the BACKGROUND policy limits tools that cannot run headlessly.
             val tokens = StringBuilder()
             var finalText: String? = null
-            chatRepository.sendMessage(convId, prompt).collect { event ->
+            chatRepository.sendMessageOrchestrated(
+                conversationId = convId,
+                content = prompt,
+                origin = ExecutionOrigin.BACKGROUND,
+            ).collect { event ->
                 when (event) {
-                    is ChatStreamEvent.Token -> tokens.append(event.text)
-                    is ChatStreamEvent.Complete -> finalText = event.message.content
-                    is ChatStreamEvent.Error -> throw event.throwable
+                    is OrchestratorEvent.ReplyToken -> tokens.append(event.text)
+                    is OrchestratorEvent.ReplyComplete -> finalText = event.finalText
+                    is OrchestratorEvent.Failed -> throw IllegalStateException(event.message)
+                    else -> Unit
                 }
             }
             val result = (finalText ?: tokens.toString()).take(200).ifBlank { "Task completed." }
