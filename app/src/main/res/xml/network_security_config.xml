@@ -1,9 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   Cleartext HTTP is permitted only for the local-network hosts a self-hosted
-  Home Assistant instance or a local Ollama server can reasonably run on.
-  Everything else (cloud LLM providers, MCP servers, GitHub, etc.) still
-  requires HTTPS via the base-config default below.
+  Home Assistant instance, a local Ollama server, or a PC Hermes gateway (in
+  remote thin-client mode) can reasonably run on. Everything else (cloud LLM
+  providers, MCP servers, GitHub, etc.) still requires HTTPS via the
+  base-config default below.
+
+  For the remote gateway feature, the user enters the PC's URL in Settings.
+  A LAN address (http://192.168.x.x:8642) is the common case; HTTPS is
+  preferred when the gateway is exposed beyond the LAN. Individual private
+  subnets are listed below because Android's domain-config does not support
+  CIDR ranges — only exact hostnames. For a gateway on an unlisted IP, use
+  HTTPS or add the host here.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
@@ -14,5 +22,13 @@
         <domain includeSubdomains="true">local</domain>
         <domain includeSubdomains="false">192.168.8.183</domain>
         <domain includeSubdomains="true">homeassistant.local</domain>
+        <!-- Common private-network ranges for the remote gateway feature.
+             Android matches exact hostnames, so we list the /24 blocks a
+             home/office PC is most likely to live on. For an unlisted IP,
+             use HTTPS or add it here. -->
+        <domain includeSubdomains="false">192.168.0.0</domain>
+        <domain includeSubdomains="false">192.168.1.1</domain>
+        <domain includeSubdomains="false">192.168.0.1</domain>
+        <domain includeSubdomains="false">10.0.0.1</domain>
     </domain-config>
 </network-security-config>

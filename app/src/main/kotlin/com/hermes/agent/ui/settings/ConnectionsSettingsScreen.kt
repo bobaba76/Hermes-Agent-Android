@@ -107,6 +107,15 @@ fun ConnectionsSettingsScreen(
                 onTestConnection = viewModel::testHomeAssistantConnection,
             )
 
+            SectionHeader(text = "Remote gateway")
+            RemoteGatewaySection(
+                settings = settings,
+                onToggle = viewModel::setRemoteGatewayEnabled,
+                onUrl = viewModel::setRemoteGatewayUrl,
+                onApiKey = viewModel::setRemoteGatewayApiKey,
+                onTestConnection = viewModel::testRemoteGatewayConnection,
+            )
+
             SectionHeader(text = "MCP servers")
             McpServersSection()
         }
@@ -387,6 +396,116 @@ private fun HomeAssistantSection(
                 checked = settings.homeAssistantDashboardEnabled,
                 onCheckedChange = onDashboardEnabled,
             )
+        }
+    }
+}
+
+@Composable
+private fun RemoteGatewaySection(
+    settings: UserSettings,
+    onToggle: (Boolean) -> Unit,
+    onUrl: (String) -> Unit,
+    onApiKey: (String) -> Unit,
+    onTestConnection: ((Boolean, String) -> Unit) -> Unit,
+) {
+    var keyVisible by remember { mutableStateOf(false) }
+    var testResult by remember { mutableStateOf<Pair<Boolean, String>?>(null) }
+    var testing by remember { mutableStateOf(false) }
+
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            ToggleRow(
+                title = "Use remote gateway",
+                subtitle = "Delegate all agent execution to a PC Hermes gateway. " +
+                    "The PC is the canonical conversation store; the phone is a chat + " +
+                    "approval surface. Requires app restart to take effect.",
+                checked = settings.remoteGatewayEnabled,
+                onCheckedChange = onToggle,
+            )
+
+            if (settings.remoteGatewayEnabled) {
+                HorizontalDivider()
+
+                Text(
+                    "Point at your PC's Hermes gateway. The gateway runs " +
+                        "`hermes gateway` and exposes an API server (default port 8642). " +
+                        "Use HTTPS when the gateway is reachable beyond your LAN; " +
+                        "cleartext HTTP is permitted for private-network hosts.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                var url by remember(settings.remoteGatewayUrl) {
+                    mutableStateOf(settings.remoteGatewayUrl)
+                }
+                OutlinedTextField(
+                    value = url,
+                    onValueChange = { url = it; onUrl(it) },
+                    label = { Text("Gateway URL") },
+                    placeholder = { Text("http://192.168.1.100:8642") },
+                    singleLine = true,
+                    colors = hermesFieldColors(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                var key by remember(settings.remoteGatewayApiKey) {
+                    mutableStateOf(settings.remoteGatewayApiKey)
+                }
+                OutlinedTextField(
+                    value = key,
+                    onValueChange = { key = it; onApiKey(it) },
+                    label = { Text("Gateway API key") },
+                    supportingText = { Text("The PC's API_SERVER_KEY (set in ~/.hermes/.env).") },
+                    visualTransformation = if (keyVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    singleLine = true,
+                    colors = hermesFieldColors(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedButton(
+                        onClick = { keyVisible = !keyVisible },
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text(if (keyVisible) "Hide key" else "Reveal key")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            testing = true
+                            testResult = null
+                            onTestConnection { success, message ->
+                                testing = false
+                                testResult = success to message
+                            }
+                        },
+                        enabled = !testing,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Text(if (testing) "Testing…" else "Test connection")
+                    }
+                }
+
+                testResult?.let { (success, message) ->
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (success) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                    )
+                }
+
+                HorizontalDivider()
+                Text(
+                    "When enabled, conversations on this phone map to PC gateway " +
+                        "sessions. A turn sent from the phone appears on the PC, and " +
+                        "vice versa. Tool approvals are forwarded to the phone's " +
+                        "existing approval dialog.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
