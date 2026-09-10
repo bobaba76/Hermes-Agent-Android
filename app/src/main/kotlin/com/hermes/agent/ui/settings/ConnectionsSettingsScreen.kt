@@ -505,6 +505,20 @@ private fun RemoteGatewaySection(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                HorizontalDivider()
+                Text(
+                    "Security: the phone inherits the full authority of the PC " +
+                        "gateway — terminal, file operations, everything the agent " +
+                        "can do. The API key is stored in the Android Keystore and " +
+                        "never leaves the device, but anyone with the key can drive " +
+                        "the agent. For a scoped connection, configure a dedicated " +
+                        "gateway profile (e.g. /p/phone/) with a restricted toolset " +
+                        "and point this URL at that profile prefix. The gateway is " +
+                        "the enforcement point — the phone cannot self-limit tools " +
+                        "that the PC has already started.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
         }
     }

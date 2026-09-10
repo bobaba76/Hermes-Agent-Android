@@ -42,6 +42,14 @@ import javax.inject.Singleton
  *
  * No local agent execution, no local LLM call, no local tool execution. The
  * phone is a display + approval surface; the PC does the work.
+ *
+ * Authority boundary: the run inherits the full authority of the PC gateway
+ * (terminal, file ops, etc.). The phone cannot self-limit this — `tool.started`
+ * events mean the tool already ran on the PC. Only `approval.request` events
+ * actually wait for the phone's decision. To scope the phone's authority,
+ * configure a dedicated gateway profile (e.g. `/p/phone/`) with a restricted
+ * toolset and point [GatewayApiClient] at that profile prefix. The gateway
+ * is the enforcement point.
  */
 @Singleton
 class RemoteOrchestrator @Inject constructor(
