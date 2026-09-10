@@ -6,9 +6,6 @@ import com.hermes.agent.domain.agent.OrchestratorEvent
 import com.hermes.agent.domain.llm.LlmMessage
 import com.hermes.agent.domain.llm.ToolCall
 import com.hermes.agent.domain.model.AgentRole
-import com.hermes.agent.domain.model.ExecutionPlan
-import com.hermes.agent.domain.model.ExecutionStep
-import com.hermes.agent.domain.model.StepStatus
 import com.hermes.agent.domain.tool.ToolConfirmationService
 import com.hermes.agent.util.DispatcherProvider
 import kotlinx.coroutines.flow.Flow
@@ -16,7 +13,6 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import timber.log.Timber
@@ -71,35 +67,23 @@ class RemoteOrchestrator @Inject constructor(
             val runId = gatewayClient.startRun(userMessage, sessionId = conversationId)
             Timber.tag("RemoteOrchestrator").i("Started remote run=%s session=%s", runId, conversationId)
 
-            // Emit a minimal plan so the UI's plan indicator lights up. The
-            // real plan lives on the PC; this is a single-step placeholder
-            // that satisfies the existing UI contract.
-            val stepId = UUID.randomUUID().toString()
-            val plan = ExecutionPlan(
-                id = UUID.randomUUID().toString(),
-                conversationId = conversationId,
-                userMessage = userMessage,
-                steps = listOf(
-                    ExecutionStep(
-                        id = stepId,
-                        agentRole = AgentRole.DEFAULT,
-                        description = "Remote gateway run",
-                        status = StepStatus.RUNNING,
-                        startedAt = System.currentTimeMillis(),
-                    ),
-                ),
-                createdAt = System.currentTimeMillis(),
-            )
-            emit(OrchestratorEvent.PlanReady(plan))
-            emit(OrchestratorEvent.StepStarted(stepId, AgentRole.DEFAULT))
+            // Track whether we've streamed any assistant text via message.delta.
+            // The run.completed event's "output" field can contain raw tool
+            // output (e.g. ls listing) rather than the assistant's reply, so
+            // we only use it as a fallback if no deltas arrived.
+            var sawReply = false
+            val replyBuilder = StringBuilder()
 
             gatewayClient.streamRunEvents(runId).collect { event ->
                 when (event) {
                     is GatewayEvent.MessageDelta -> {
+                        sawReply = true
+                        replyBuilder.append(event.text)
                         emit(OrchestratorEvent.ReplyToken(event.text))
                     }
 
                     is GatewayEvent.MessageComplete -> {
+                        sawReply = true
                         emit(OrchestratorEvent.ReplyComplete(
                             event.text,
                             AgentRole.DEFAULT,
@@ -108,13 +92,13 @@ class RemoteOrchestrator @Inject constructor(
                     }
 
                     is GatewayEvent.ToolStarted -> {
-                        val call = parseToolCall(event.callId, event.name, event.arguments)
-                        emit(OrchestratorEvent.ToolCallRequested(call, requiresConfirmation = false))
+                        // Suppress — the phone is a thin client. Tool
+                        // execution details live on the PC; the user only
+                        // wants the reply text and approval requests.
                     }
 
                     is GatewayEvent.ToolCompleted -> {
-                        val call = parseToolCall(event.callId, event.name, "")
-                        emit(OrchestratorEvent.ToolCallResult(call, event.output, event.success))
+                        // Suppress — see ToolStarted above.
                     }
 
                     is GatewayEvent.ApprovalRequested -> {
@@ -134,13 +118,24 @@ class RemoteOrchestrator @Inject constructor(
                     }
 
                     is GatewayEvent.RunCompleted -> {
-                        // If no MessageComplete was emitted, emit a final reply
-                        // from the run output so the UI still gets a terminal event.
-                        emit(OrchestratorEvent.ReplyComplete(
-                            event.output,
-                            AgentRole.DEFAULT,
-                            isOnDevice = false,
-                        ))
+                        // Only emit a reply from run.completed if we never saw
+                        // any message deltas — the output field can contain
+                        // raw tool output rather than the assistant's text.
+                        if (!sawReply && event.output.isNotBlank()) {
+                            emit(OrchestratorEvent.ReplyComplete(
+                                event.output,
+                                AgentRole.DEFAULT,
+                                isOnDevice = false,
+                            ))
+                        } else if (sawReply && replyBuilder.isNotEmpty()) {
+                            // Ensure the UI gets a terminal ReplyComplete from
+                            // the accumulated deltas if no MessageComplete fired.
+                            emit(OrchestratorEvent.ReplyComplete(
+                                replyBuilder.toString(),
+                                AgentRole.DEFAULT,
+                                isOnDevice = false,
+                            ))
+                        }
                     }
 
                     is GatewayEvent.RunFailed -> {
@@ -166,8 +161,6 @@ class RemoteOrchestrator @Inject constructor(
                     }
                 }
             }
-
-            emit(OrchestratorEvent.StepFinished(stepId, success = true))
         } catch (e: Exception) {
             Timber.tag("RemoteOrchestrator").e(e, "Remote run failed")
             emit(OrchestratorEvent.Failed(e.message ?: "Remote gateway error"))

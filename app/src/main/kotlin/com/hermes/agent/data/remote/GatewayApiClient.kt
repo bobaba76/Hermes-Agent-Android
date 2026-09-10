@@ -82,7 +82,7 @@ class GatewayApiClient @Inject constructor(
         val key = apiKey()
         val body = buildString {
             append("{")
-            append("\"input\":").append(json.encodeToString(JsonObject.serializer(), JsonObject(mapOf("content" to JsonPrimitive(input)))))
+            append("\"input\":").append(json.encodeToString(JsonPrimitive.serializer(), JsonPrimitive(input)))
             if (sessionId != null) {
                 append(",\"session_id\":").append(json.encodeToString(JsonPrimitive.serializer(), JsonPrimitive(sessionId)))
             }
@@ -92,7 +92,11 @@ class GatewayApiClient @Inject constructor(
             .post(body.toRequestBody(jsonMediaType))
             .build()
         val response = client.newCall(request).execute()
-        if (!response.isSuccessful) throw IOException("startRun failed: ${response.code}")
+        if (!response.isSuccessful) {
+            val errBody = response.body?.string().orEmpty()
+            response.close()
+            throw IOException("startRun failed: ${response.code} $errBody")
+        }
         val responseBody = response.body?.string().orEmpty()
         response.close()
         val parsed = json.parseToJsonElement(responseBody).jsonObject
@@ -124,20 +128,17 @@ class GatewayApiClient @Inject constructor(
         }
         val reader = BufferedReader(body.charStream())
         try {
-            var eventType = ""
-            val dataBuilder = StringBuilder()
             while (coroutineContext[Job]?.isActive != false) {
                 val line = reader.readLine() ?: break
                 when {
-                    line.startsWith("event:") -> eventType = line.removePrefix("event:").trim()
+                    // SSE comment — ": stream closed" etc. — signals end.
+                    line.startsWith(":") && line.contains("closed", ignoreCase = true) -> break
+                    line.startsWith("event:") -> { /* gateway puts event type in JSON, not here */ }
                     line.startsWith("data:") -> {
-                        dataBuilder.append(line.removePrefix("data:").trim())
-                    }
-                    line.isEmpty() && dataBuilder.isNotEmpty() -> {
-                        val data = dataBuilder.toString()
-                        dataBuilder.setLength(0)
-                        parseEvent(eventType.ifEmpty { "message" }, data)?.let { emit(it) }
-                        eventType = ""
+                        val data = line.removePrefix("data:").trim()
+                        if (data.isNotBlank() && data != "[DONE]") {
+                            parseEvent("", data)?.let { emit(it) }
+                        }
                     }
                 }
             }
@@ -301,7 +302,11 @@ class GatewayApiClient @Inject constructor(
             Timber.tag("GatewayClient").w(it, "could not parse SSE event: %s", data.take(200))
             return null
         }
-        return when (type) {
+        // The gateway puts the event type inside the JSON as "event",
+        // not as a separate SSE event: line. Fall back to the SSE type
+        // parameter for compatibility with standard SSE senders.
+        val eventType = obj["event"]?.jsonPrimitive?.contentOrNull ?: type
+        return when (eventType) {
             "message.delta", "assistant.delta" -> {
                 val text = obj["delta"]?.jsonPrimitive?.contentOrNull
                     ?: obj["text"]?.jsonPrimitive?.contentOrNull
@@ -319,23 +324,29 @@ class GatewayApiClient @Inject constructor(
             "tool.started", "tool.start" -> {
                 GatewayEvent.ToolStarted(
                     callId = obj["call_id"]?.jsonPrimitive?.contentOrNull ?: "",
-                    name = obj["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                    arguments = obj["arguments"]?.jsonPrimitive?.contentOrNull ?: "",
+                    name = obj["tool"]?.jsonPrimitive?.contentOrNull
+                        ?: obj["name"]?.jsonPrimitive?.contentOrNull ?: "",
+                    arguments = obj["arguments"]?.jsonPrimitive?.contentOrNull
+                        ?: obj["preview"]?.jsonPrimitive?.contentOrNull ?: "",
                 )
             }
             "tool.completed", "tool.complete" -> {
                 GatewayEvent.ToolCompleted(
                     callId = obj["call_id"]?.jsonPrimitive?.contentOrNull ?: "",
-                    name = obj["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                    output = obj["output"]?.jsonPrimitive?.contentOrNull ?: "",
-                    success = obj["success"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull() ?: true,
+                    name = obj["tool"]?.jsonPrimitive?.contentOrNull
+                        ?: obj["name"]?.jsonPrimitive?.contentOrNull ?: "",
+                    output = obj["output"]?.jsonPrimitive?.contentOrNull
+                        ?: obj["result"]?.jsonPrimitive?.contentOrNull ?: "",
+                    success = obj["error"]?.jsonPrimitive?.contentOrNull?.toBooleanStrictOrNull()
+                        ?.let { !it } ?: true,
                 )
             }
             "approval.request" -> {
                 GatewayEvent.ApprovalRequested(
                     callId = obj["call_id"]?.jsonPrimitive?.contentOrNull
                         ?: obj["request_id"]?.jsonPrimitive?.contentOrNull ?: "",
-                    toolName = obj["tool_name"]?.jsonPrimitive?.contentOrNull
+                    toolName = obj["tool"]?.jsonPrimitive?.contentOrNull
+                        ?: obj["tool_name"]?.jsonPrimitive?.contentOrNull
                         ?: obj["name"]?.jsonPrimitive?.contentOrNull ?: "",
                     arguments = obj["arguments"]?.jsonPrimitive?.contentOrNull ?: "",
                 )
@@ -364,7 +375,9 @@ class GatewayApiClient @Inject constructor(
                     summary = obj["summary"]?.jsonPrimitive?.contentOrNull ?: "",
                 )
             }
-            else -> GatewayEvent.Unknown(type, data)
+            // Informational events we don't surface to the UI yet.
+            "reasoning.available", "reasoning.delta", "reasoning.complete" -> null
+            else -> GatewayEvent.Unknown(eventType, data)
         }
     }
 
@@ -385,17 +398,24 @@ class GatewayApiClient @Inject constructor(
             ?: throw IOException("could not parse session: ${body.take(200)}")
 
     private fun parseSession(obj: JsonObject): RemoteSession? {
-        val id = obj["id"]?.jsonPrimitive?.contentOrNull ?: obj["session_id"]?.jsonPrimitive?.contentOrNull ?: return null
+        // The gateway wraps session objects in a "session" key for single
+        // responses (POST /api/sessions, GET /api/sessions/{id}) but not for
+        // list responses (GET /api/sessions wraps in "data" array).
+        val sessionObj = (obj["session"] as? JsonObject) ?: obj
+        val id = sessionObj["id"]?.jsonPrimitive?.contentOrNull
+            ?: sessionObj["session_id"]?.jsonPrimitive?.contentOrNull ?: return null
         return RemoteSession(
             id = id,
-            title = obj["title"]?.jsonPrimitive?.contentOrNull ?: "Untitled",
-            createdAt = obj["created_at"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
-                ?: obj["created"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
-                ?: System.currentTimeMillis(),
-            updatedAt = obj["updated_at"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
-                ?: obj["updated"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
-                ?: System.currentTimeMillis(),
-            messageCount = obj["message_count"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0,
+            title = sessionObj["title"]?.jsonPrimitive?.contentOrNull ?: "Untitled",
+            createdAt = ((sessionObj["started_at"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                ?: sessionObj["created_at"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                ?: sessionObj["created"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                ?: (System.currentTimeMillis() / 1000.0)) * 1000).toLong(),
+            updatedAt = ((sessionObj["last_active"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                ?: sessionObj["updated_at"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                ?: sessionObj["updated"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                ?: (System.currentTimeMillis() / 1000.0)) * 1000).toLong(),
+            messageCount = sessionObj["message_count"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: 0,
         )
     }
 
@@ -417,9 +437,9 @@ class GatewayApiClient @Inject constructor(
             id = obj["id"]?.jsonPrimitive?.contentOrNull ?: java.util.UUID.randomUUID().toString(),
             role = role,
             content = content,
-            timestamp = obj["timestamp"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
-                ?: obj["created_at"]?.jsonPrimitive?.contentOrNull?.toLongOrNull()
-                ?: System.currentTimeMillis(),
+            timestamp = ((obj["timestamp"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                ?: obj["created_at"]?.jsonPrimitive?.contentOrNull?.toDoubleOrNull()
+                ?: (System.currentTimeMillis() / 1000.0)) * 1000).toLong(),
         )
     }
 }

@@ -30,5 +30,10 @@
         <domain includeSubdomains="false">192.168.1.1</domain>
         <domain includeSubdomains="false">192.168.0.1</domain>
         <domain includeSubdomains="false">10.0.0.1</domain>
+        <!-- Tailscale CGNAT range (100.64.0.0/10). Tailscale IPs are stable
+             per device, so listing the specific IP is sufficient. Traffic
+             is encrypted by the WireGuard tunnel; cleartext HTTP over
+             Tailscale is still end-to-end encrypted. -->
+        <domain includeSubdomains="false">100.85.20.22</domain>
     </domain-config>
 </network-security-config>

@@ -38,6 +38,7 @@ class RemoteConversationRepository @Inject constructor(
     /** Poll interval for the conversation list and message history. */
     private companion object {
         const val POLL_INTERVAL_MS = 5_000L
+        val ALLOWED_ROLES = setOf(MessageRole.USER, MessageRole.ASSISTANT)
     }
 
     override fun observeConversations(): Flow<List<Conversation>> = flow {
@@ -71,8 +72,13 @@ class RemoteConversationRepository @Inject constructor(
     }.flowOn(dispatchers.io)
 
     override suspend fun createConversation(title: String): String {
-        val session = gatewayClient.createSession(title)
-        return session.id
+        // Try to create on the gateway; if it fails (400, network error,
+        // etc.), fall back to a local UUID. The RemoteOrchestrator will
+        // pass this ID as session_id to startRun, and the gateway creates
+        // the session on demand when the first run is submitted.
+        return runCatching { gatewayClient.createSession(title).id }
+            .onFailure { Timber.tag("RemoteConvRepo").w(it, "createSession failed — using local UUID") }
+            .getOrElse { java.util.UUID.randomUUID().toString() }
     }
 
     override suspend fun ensureConversation(id: String, title: String) {
@@ -128,7 +134,14 @@ class RemoteConversationRepository @Inject constructor(
         runCatching { gatewayClient.getSession(id).toConversation() }.getOrNull()
 
     private suspend fun fetchMessages(conversationId: String): List<Message> =
-        gatewayClient.getSessionMessages(conversationId).map { it.toMessage(conversationId) }
+        gatewayClient.getSessionMessages(conversationId)
+            // The gateway stores tool results and system instructions as
+            // separate messages in the session transcript. The phone is a
+            // thin chat client — only user and assistant turns belong in the
+            // chat UI. Tool output (e.g. raw ls listings, file listings as
+            // JSON) would otherwise appear as assistant-style bubbles.
+            .filter { it.toMessage(conversationId).role in ALLOWED_ROLES }
+            .map { it.toMessage(conversationId) }
 
     // ── Mappers ───────────────────────────────────────────────────────────
 
