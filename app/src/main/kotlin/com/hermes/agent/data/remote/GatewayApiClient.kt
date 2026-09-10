@@ -12,6 +12,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -155,14 +156,19 @@ class GatewayApiClient @Inject constructor(
     suspend fun submitApproval(runId: String, approved: Boolean) = withContext(dispatchers.io) {
         val base = baseUrl()
         val key = apiKey()
-        val body = """{"approved":$approved}"""
+        // The gateway expects {"choice": "once"|"deny"}; a bare
+        // {"approved": <bool>} body is rejected with `invalid_approval_choice`
+        // (400) and the run keeps waiting for a decision on the PC.
+        val choice = if (approved) "once" else "deny"
+        val body = """{"choice":"$choice"}"""
         val request = authBuilder("$base/v1/runs/$runId/approval", key)
             .post(body.toRequestBody(jsonMediaType))
             .build()
         val response = client.newCall(request).execute()
+        val errorBody = if (response.isSuccessful) "" else response.body?.string().orEmpty()
         response.close()
         if (!response.isSuccessful) {
-            Timber.tag("GatewayClient").w("submitApproval failed: %d", response.code)
+            Timber.tag("GatewayClient").w("submitApproval failed: %d %s", response.code, errorBody.take(200))
         }
     }
 
@@ -342,13 +348,21 @@ class GatewayApiClient @Inject constructor(
                 )
             }
             "approval.request" -> {
+                // The gateway's approval payload carries `description` (a human
+                // label for the action) and the redacted `command` - not the
+                // tool/name/arguments shape used by tool.* events. Map them so
+                // the confirmation dialog shows what is actually being approved.
+                val command = obj["command"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                val description = obj["description"]?.jsonPrimitive?.contentOrNull.orEmpty()
                 GatewayEvent.ApprovalRequested(
                     callId = obj["call_id"]?.jsonPrimitive?.contentOrNull
                         ?: obj["request_id"]?.jsonPrimitive?.contentOrNull ?: "",
-                    toolName = obj["tool"]?.jsonPrimitive?.contentOrNull
-                        ?: obj["tool_name"]?.jsonPrimitive?.contentOrNull
-                        ?: obj["name"]?.jsonPrimitive?.contentOrNull ?: "",
-                    arguments = obj["arguments"]?.jsonPrimitive?.contentOrNull ?: "",
+                    toolName = description.ifBlank { command },
+                    arguments = if (command.isBlank()) {
+                        ""
+                    } else {
+                        buildJsonObject { put("command", JsonPrimitive(command)) }.toString()
+                    },
                 )
             }
             "run.completed" -> {

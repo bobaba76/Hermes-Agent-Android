@@ -94,6 +94,14 @@ class RemoteChatRepository @Inject constructor(
             origin = origin,
         )
 
+    /**
+     * Thin-client only: ask the PC to stop the run currently streaming
+     * to this phone, if any. Fire-and-forget; safe when nothing is running.
+     */
+    fun stopActiveRun() {
+        remoteOrchestrator.stopActiveRun()
+    }
+
     override fun summarizeConversation(conversationId: String) {
         // No-op: the PC gateway handles memory and consolidation.
         Timber.tag("RemoteChatRepo").d("summarizeConversation is a no-op in remote mode")

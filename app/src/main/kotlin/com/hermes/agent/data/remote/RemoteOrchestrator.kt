@@ -8,9 +8,14 @@ import com.hermes.agent.domain.llm.ToolCall
 import com.hermes.agent.domain.model.AgentRole
 import com.hermes.agent.domain.tool.ToolConfirmationService
 import com.hermes.agent.util.DispatcherProvider
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -55,6 +60,16 @@ class RemoteOrchestrator @Inject constructor(
     private val dispatchers: DispatcherProvider,
 ) : Orchestrator {
 
+    /**
+     * Fire-and-forget scope for stop requests: the request must still go out
+     * even though the chat job that triggers it is being cancelled.
+     */
+    private val stopScope = CoroutineScope(SupervisorJob() + dispatchers.io)
+
+    /** Run currently streaming to this phone, if any (target of [stopActiveRun]). */
+    @Volatile
+    private var activeRunId: String? = null
+
     override fun run(
         conversationId: String,
         userMessage: String,
@@ -65,6 +80,7 @@ class RemoteOrchestrator @Inject constructor(
         // session transcript from the session_id we pass to startRun.
         try {
             val runId = gatewayClient.startRun(userMessage, sessionId = conversationId)
+            activeRunId = runId
             Timber.tag("RemoteOrchestrator").i("Started remote run=%s session=%s", runId, conversationId)
 
             // Track whether we've streamed any assistant text via message.delta.
@@ -74,7 +90,9 @@ class RemoteOrchestrator @Inject constructor(
             var sawReply = false
             val replyBuilder = StringBuilder()
 
-            gatewayClient.streamRunEvents(runId).collect { event ->
+            gatewayClient.streamRunEvents(runId).onCompletion {
+                if (activeRunId == runId) activeRunId = null
+            }.collect { event ->
                 when (event) {
                     is GatewayEvent.MessageDelta -> {
                         sawReply = true
@@ -161,11 +179,27 @@ class RemoteOrchestrator @Inject constructor(
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            // Stop button / screen teardown - not a run failure; propagate.
+            throw e
         } catch (e: Exception) {
             Timber.tag("RemoteOrchestrator").e(e, "Remote run failed")
             emit(OrchestratorEvent.Failed(e.message ?: "Remote gateway error"))
         }
     }.flowOn(dispatchers.io)
+
+    /**
+     * Ask the PC to stop the run currently streaming to this phone, if any.
+     * Fire-and-forget; safe to call when nothing is running.
+     */
+    fun stopActiveRun() {
+        val runId = activeRunId ?: return
+        Timber.tag("RemoteOrchestrator").i("Stopping remote run=%s", runId)
+        stopScope.launch {
+            runCatching { gatewayClient.stopRun(runId) }
+                .onFailure { Timber.tag("RemoteOrchestrator").w(it, "Failed to stop run=%s", runId) }
+        }
+    }
 
     /**
      * Parse a tool call from the gateway's event payload.
