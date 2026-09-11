@@ -52,4 +52,12 @@ object ApiServerController {
         }
         context.startService(intent)
     }
+
+    /** Replace the in-memory server so a rotated bearer key takes effect now. */
+    fun restart(context: Context) {
+        val intent = Intent(context, ApiServerService::class.java).apply {
+            action = ApiServerService.ACTION_RESTART
+        }
+        ContextCompat.startForegroundService(context, intent)
+    }
 }

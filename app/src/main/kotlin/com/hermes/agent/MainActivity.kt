@@ -178,7 +178,7 @@ class MainActivity : FragmentActivity() {
                 // pick a persona/prompt template — the shared text is sent as-is.
                 val shareText = intent.getStringExtra("EXTRA_SHARE_TEXT")
                 if (!shareText.isNullOrBlank()) {
-                    PendingChatIntent.publish(PendingChatIntent.Action.SendText(shareText))
+                    PendingChatIntent.publish(PendingChatIntent.Action.PrefillText(shareText))
                     pendingChatIntentTrigger = true
                 }
             }
@@ -189,7 +189,7 @@ class MainActivity : FragmentActivity() {
             "com.hermes.agent.action.NOTIFICATION_REPLY" -> {
                 val replyText = intent.getStringExtra("EXTRA_REPLY_TEXT")
                 if (!replyText.isNullOrBlank()) {
-                    PendingChatIntent.publish(PendingChatIntent.Action.SendText(replyText))
+                    PendingChatIntent.publish(PendingChatIntent.Action.PrefillText(replyText))
                     pendingChatIntentTrigger = true
                 }
             }

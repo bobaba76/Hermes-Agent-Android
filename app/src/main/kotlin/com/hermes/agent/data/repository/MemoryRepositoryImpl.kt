@@ -6,6 +6,7 @@ import com.hermes.agent.data.local.dao.MemoryDao
 import com.hermes.agent.data.local.entity.MemoryEntity
 import com.hermes.agent.data.memory.EmbeddingService
 import com.hermes.agent.data.memory.VectorEntry
+import com.hermes.agent.data.memory.VectorNamespaces
 import com.hermes.agent.data.memory.VectorStore
 import com.hermes.agent.domain.model.Memory
 import com.hermes.agent.domain.repository.MemoryRepository
@@ -96,7 +97,9 @@ class MemoryRepositoryImpl @Inject constructor(
                 .getOrNull()
                 ?: return@withContext keywordFallback(query, limit)
 
-            val hits = vectorStore.search(queryVec, limit = limit)
+            val hits = vectorStore.search(queryVec, limit = limit) { entry ->
+                !VectorNamespaces.isRagId(entry.id)
+            }
             if (hits.isEmpty()) {
                 return@withContext keywordFallback(query, limit)
             }
