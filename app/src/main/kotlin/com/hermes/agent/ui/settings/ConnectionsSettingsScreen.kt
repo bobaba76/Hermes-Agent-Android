@@ -35,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -429,8 +430,11 @@ private fun RemoteGatewaySection(
                 Text(
                     "Point at your PC's Hermes gateway. The gateway runs " +
                         "`hermes gateway` and exposes an API server (default port 8642). " +
-                        "Use HTTPS when the gateway is reachable beyond your LAN; " +
-                        "cleartext HTTP is permitted for private-network hosts.",
+                        "Use a hostname the phone can resolve: an mDNS name " +
+                        "(http://hermes-pc.local:8642) on your LAN, or a Tailscale " +
+                        "MagicDNS name (http://mymachine.tailnet.ts.net:8642). " +
+                        "Cleartext HTTP is allowed for these hosts; for a raw IP " +
+                        "use HTTPS, Tailscale Serve, or a reverse proxy.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -442,7 +446,7 @@ private fun RemoteGatewaySection(
                     value = url,
                     onValueChange = { url = it; onUrl(it) },
                     label = { Text("Gateway URL") },
-                    placeholder = { Text("http://192.168.1.100:8642") },
+                    placeholder = { Text("http://hermes-pc.local:8642") },
                     singleLine = true,
                     colors = hermesFieldColors(),
                     modifier = Modifier.fillMaxWidth(),
@@ -453,13 +457,20 @@ private fun RemoteGatewaySection(
                 }
                 OutlinedTextField(
                     value = key,
-                    onValueChange = { key = it; onApiKey(it) },
+                    onValueChange = { key = it },
                     label = { Text("Gateway API key") },
                     supportingText = { Text("The PC's API_SERVER_KEY (set in ~/.hermes/.env).") },
                     visualTransformation = if (keyVisible) VisualTransformation.None else PasswordVisualTransformation(),
                     singleLine = true,
                     colors = hermesFieldColors(),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().onFocusChanged { focusState ->
+                        // Persist on focus loss, not per keystroke: the API key
+                        // is encrypted with the hardware Keystore on every write,
+                        // which is far too slow to run for each character typed.
+                        if (!focusState.isFocused && key != settings.remoteGatewayApiKey) {
+                            onApiKey(key)
+                        }
+                    },
                 )
 
                 Row(
@@ -474,6 +485,9 @@ private fun RemoteGatewaySection(
                     }
                     OutlinedButton(
                         onClick = {
+                            // The field saves on focus loss; save explicitly too
+                            // in case the button press consumed the focus event.
+                            if (key != settings.remoteGatewayApiKey) onApiKey(key)
                             testing = true
                             testResult = null
                             onTestConnection { success, message ->
