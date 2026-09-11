@@ -88,6 +88,9 @@ class RemoteOrchestrator @Inject constructor(
             // output (e.g. ls listing) rather than the assistant's reply, so
             // we only use it as a fallback if no deltas arrived.
             var sawReply = false
+            // MessageComplete already terminated the reply; run.completed must
+            // not emit a second ReplyComplete (voice mode would speak twice).
+            var replyCompleteEmitted = false
             val replyBuilder = StringBuilder()
 
             gatewayClient.streamRunEvents(runId).onCompletion {
@@ -102,6 +105,7 @@ class RemoteOrchestrator @Inject constructor(
 
                     is GatewayEvent.MessageComplete -> {
                         sawReply = true
+                        replyCompleteEmitted = true
                         emit(OrchestratorEvent.ReplyComplete(
                             event.text,
                             AgentRole.DEFAULT,
@@ -128,24 +132,36 @@ class RemoteOrchestrator @Inject constructor(
                         val call = parseToolCall(event.callId, event.toolName, event.arguments)
                         emit(OrchestratorEvent.ToolCallRequested(call, requiresConfirmation = true))
                         val approved = toolConfirmationService.awaitConfirmation(call)
+                        // Resolve the tool badge immediately: tool.completed is
+                        // deliberately suppressed in thin-client mode, so the
+                        // card would otherwise stay stuck in RUNNING until the
+                        // entire run finishes.
+                        emit(
+                            OrchestratorEvent.ToolCallResult(
+                                call,
+                                if (approved) "Approved" else "Denied by user",
+                                approved,
+                            ),
+                        )
                         Timber.tag("RemoteOrchestrator").i(
                             "Approval call=%s approved=%s — forwarding to PC",
                             event.toolName, approved,
                         )
-                        gatewayClient.submitApproval(runId, approved)
+                        gatewayClient.submitApproval(runId, approved, event.requestId)
                     }
 
                     is GatewayEvent.RunCompleted -> {
-                        // Only emit a reply from run.completed if we never saw
-                        // any message deltas — the output field can contain
-                        // raw tool output rather than the assistant's text.
-                        if (!sawReply && event.output.isNotBlank()) {
+                        // If MessageComplete already emitted the terminal
+                        // ReplyComplete, skip all fallback paths — emitting
+                        // a second one would double-speak the reply in voice
+                        // mode and emit duplicate completion events upstream.
+                        if (!replyCompleteEmitted && !sawReply && event.output.isNotBlank()) {
                             emit(OrchestratorEvent.ReplyComplete(
                                 event.output,
                                 AgentRole.DEFAULT,
                                 isOnDevice = false,
                             ))
-                        } else if (sawReply && replyBuilder.isNotEmpty()) {
+                        } else if (!replyCompleteEmitted && sawReply && replyBuilder.isNotEmpty()) {
                             // Ensure the UI gets a terminal ReplyComplete from
                             // the accumulated deltas if no MessageComplete fired.
                             emit(OrchestratorEvent.ReplyComplete(

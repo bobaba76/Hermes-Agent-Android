@@ -146,6 +146,9 @@ class GatewayApiClient @Inject constructor(
         } catch (e: IOException) {
             if (coroutineContext[Job]?.isActive != false) {
                 Timber.tag("GatewayClient").w(e, "SSE stream interrupted")
+                // Surface the drop so the UI leaves the loading state instead
+                // of hanging on isSending = true until the user taps Stop.
+                emit(GatewayEvent.RunFailed("Connection lost: ${e.message ?: "SSE stream interrupted"}"))
             }
         } finally {
             response.close()
@@ -153,14 +156,19 @@ class GatewayApiClient @Inject constructor(
     }.flowOn(dispatchers.io)
 
     /** Resolve a pending approval for a run. */
-    suspend fun submitApproval(runId: String, approved: Boolean) = withContext(dispatchers.io) {
+    suspend fun submitApproval(runId: String, approved: Boolean, requestId: String = "") = withContext(dispatchers.io) {
         val base = baseUrl()
         val key = apiKey()
         // The gateway expects {"choice": "once"|"deny"}; a bare
         // {"approved": <bool>} body is rejected with `invalid_approval_choice`
         // (400) and the run keeps waiting for a decision on the PC.
+        // Room-scoped or profile-scoped gateway instances additionally
+        // require the approval's request_id and reject requests without it.
         val choice = if (approved) "once" else "deny"
-        val body = """{"choice":"$choice"}"""
+        val body = buildJsonObject {
+            put("choice", JsonPrimitive(choice))
+            if (requestId.isNotBlank()) put("request_id", JsonPrimitive(requestId))
+        }.toString()
         val request = authBuilder("$base/v1/runs/$runId/approval", key)
             .post(body.toRequestBody(jsonMediaType))
             .build()
@@ -363,6 +371,7 @@ class GatewayApiClient @Inject constructor(
                     } else {
                         buildJsonObject { put("command", JsonPrimitive(command)) }.toString()
                     },
+                    requestId = obj["request_id"]?.jsonPrimitive?.contentOrNull ?: "",
                 )
             }
             "run.completed" -> {

@@ -44,6 +44,12 @@ sealed class GatewayEvent {
         val callId: String,
         val toolName: String,
         val arguments: String,
+        /**
+         * Gateway-side id of the pending approval. Room-scoped or
+         * profile-scoped gateway instances require it to be echoed back
+         * on the approval POST and reject requests without it.
+         */
+        val requestId: String,
     ) : GatewayEvent()
 
     /** The run has completed successfully. Terminal for the entire run. */
