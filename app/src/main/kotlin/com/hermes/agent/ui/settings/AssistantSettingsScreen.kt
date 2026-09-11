@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -42,8 +44,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import android.content.Intent
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -373,13 +378,15 @@ private fun OnDeviceAiCard(
             }
 
             // ── Download folder ─────────────────────────────────────────────
+            // Every half-typed path here names a folder with no models in it,
+            // and committing one unloads the chat and tool-caller models both.
+            // Hold the text locally and commit once the edit is finished — on
+            // Done, or when the field loses focus. Blank still means "default".
+            val focusManager = LocalFocusManager.current
             var dirText by remember(settings.modelDownloadDir) { mutableStateOf(settings.modelDownloadDir) }
             OutlinedTextField(
                 value = dirText,
-                onValueChange = {
-                    dirText = it
-                    viewModel.setModelDownloadDir(it)
-                },
+                onValueChange = { dirText = it },
                 enabled = !isDownloading,
                 label = { Text("Download folder") },
                 placeholder = { Text("/storage/emulated/0/${viewModel.defaultModelDirName}") },
@@ -387,8 +394,16 @@ private fun OnDeviceAiCard(
                     Text("Leave blank to use the default \"${viewModel.defaultModelDirName}\" folder in internal storage.")
                 },
                 singleLine = true,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
                 colors = hermesFieldColors(),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { focus ->
+                        if (!focus.isFocused && dirText.trim() != settings.modelDownloadDir) {
+                            viewModel.setModelDownloadDir(dirText)
+                        }
+                    },
             )
 
             // ── Storage permission gate ─────────────────────────────────────
