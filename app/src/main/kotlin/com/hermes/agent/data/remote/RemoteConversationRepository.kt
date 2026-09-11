@@ -43,30 +43,29 @@ class RemoteConversationRepository @Inject constructor(
 
     override fun observeConversations(): Flow<List<Conversation>> = flow {
         while (true) {
-            val conversations = runCatching { fetchConversations() }
+            // Emit only on success: a transient poll failure must not wipe
+            // the list off screen (a getOrDefault(emptyList()) would blank it).
+            runCatching { fetchConversations() }
+                .onSuccess { emit(it) }
                 .onFailure { Timber.tag("RemoteConvRepo").w(it, "polling sessions failed") }
-                .getOrDefault(emptyList())
-            emit(conversations)
             delay(POLL_INTERVAL_MS)
         }
     }.flowOn(dispatchers.io)
 
     override fun observeConversation(id: String): Flow<Conversation?> = flow {
         while (true) {
-            val conversation = runCatching { fetchConversation(id) }
+            runCatching { fetchConversation(id) }
+                .onSuccess { emit(it) }
                 .onFailure { Timber.tag("RemoteConvRepo").w(it, "polling session %s failed", id) }
-                .getOrNull()
-            emit(conversation)
             delay(POLL_INTERVAL_MS)
         }
     }.flowOn(dispatchers.io)
 
     override fun observeMessages(conversationId: String): Flow<List<Message>> = flow {
         while (true) {
-            val messages = runCatching { fetchMessages(conversationId) }
+            runCatching { fetchMessages(conversationId) }
+                .onSuccess { emit(it) }
                 .onFailure { Timber.tag("RemoteConvRepo").w(it, "polling messages for %s failed", conversationId) }
-                .getOrDefault(emptyList())
-            emit(messages)
             delay(POLL_INTERVAL_MS)
         }
     }.flowOn(dispatchers.io)
